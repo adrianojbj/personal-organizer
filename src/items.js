@@ -1,13 +1,16 @@
-import { normRecur, alignDate, lastSlotKey, slotsOf, MAX_SLOTS } from "../public/lib/agenda.js";
+import { normRecur, alignDate, lastSlotKey, MAX_SLOTS } from "../public/lib/agenda.js";
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 
 export class ValidationError extends Error {}
 
+const toMinutes = hm => { const [h, m] = hm.split(":").map(Number); return h * 60 + m; };
+
 export function rowToItem(r) {
   return {
     id: r.id,
+    kind: r.kind,
     title: r.title,
     date: r.date,
     time: r.time,
@@ -32,28 +35,32 @@ export function cleanInput(body, base = {}) {
   const title = String(v.title ?? "").trim();
   if (!title || title.length > 200) throw new ValidationError("O título precisa ter entre 1 e 200 caracteres.");
   if (!DATE_RE.test(v.date ?? "")) throw new ValidationError("Data inválida. Use AAAA-MM-DD.");
+  const kind = v.kind === "reminder" ? "reminder" : "task";
   const time = v.time ?? "";
   if (time !== "" && !TIME_RE.test(time)) throw new ValidationError("Hora inválida. Use HH:MM.");
+  if (kind === "reminder" && !time) throw new ValidationError("Lembrete precisa de um horário de aviso.");
   let every = Number(v.every) || 0, until = String(v.until ?? "");
-  if (!time) { every = 0; until = ""; }
+  if (kind === "task") { every = 0; until = ""; }
   if (every) {
     if (!Number.isInteger(every) || every < 5 || every > 720) throw new ValidationError("O intervalo deve ficar entre 5 minutos e 12 horas.");
     if (!TIME_RE.test(until) || until <= time) throw new ValidationError("O horário final precisa ser depois do horário inicial.");
-    if (slotsOf({ time, every, until }).length >= MAX_SLOTS) throw new ValidationError(`São no máximo ${MAX_SLOTS} avisos por dia. Aumente o intervalo.`);
+    const count = Math.floor((toMinutes(until) - toMinutes(time)) / every) + 1;
+    if (count > MAX_SLOTS) throw new ValidationError(`São no máximo ${MAX_SLOTS} avisos por dia. Aumente o intervalo.`);
   } else until = "";
-  const prio = Number(v.prio ?? 0);
+  // Prioridade só existe em tarefas; lembretes avisam no horário.
+  const prio = kind === "task" ? Number(v.prio ?? 0) : 0;
   if (![0, 1, 2].includes(prio)) throw new ValidationError("Prioridade deve ser 0, 1 ou 2.");
   const notes = String(v.notes ?? "");
   if (notes.length > 4000) throw new ValidationError("As notas passam de 4000 caracteres.");
   const recur = normRecur(v.recur, v.date);
   const date = alignDate(recur, v.date);
   return {
-    title, date, time, every, until, prio, notes, recur,
+    kind, title, date, time, every, until, prio, notes, recur,
     done: !!v.done,
     doneAt: v.doneAt ?? null,
     lastDone: v.lastDone ?? null,
-    ack: String(v.ack ?? ""),
-    snooze: Number(v.snooze) || 0,
+    ack: kind === "reminder" ? String(v.ack ?? "") : "",
+    snooze: kind === "reminder" ? Number(v.snooze) || 0 : 0,
   };
 }
 
@@ -65,11 +72,18 @@ const sameSchedule = (a, b) =>
  * ou reprogramado não vão para o Slack; adiar libera o aviso atual de novo.
  */
 export function notifiedKeyFor(next, prev, local) {
-  if (!next.time) return "";
+  if (next.kind !== "reminder" || !next.time) return "";
   const newSnooze = next.snooze && next.snooze > Date.now() && (!prev || next.snooze !== prev.snooze);
   if (newSnooze) return "";
   if (prev && sameSchedule(prev, next) && next.snooze === prev.snooze) return prev.notifiedKey;
   return lastSlotKey(next, local.date, local.hm) || "";
+}
+
+/** Ao criar ou reprogramar um lembrete, os horários que já passaram contam como vistos na página. */
+export function skipPassedSlots(next, prev, local) {
+  if (next.kind !== "reminder" || (prev && sameSchedule(prev, next))) return next;
+  const key = lastSlotKey(next, local.date, local.hm);
+  return key && key > (next.ack || "") ? { ...next, ack: key } : next;
 }
 
 export async function listItems(db) {
@@ -84,17 +98,17 @@ export async function getItem(db, id) {
 
 export async function saveItem(db, id, it, notifiedKey, created) {
   await db.prepare(
-    `INSERT INTO items (id, title, date, time, prio, notes, recur, done, done_at, last_done, ack, snooze, notified_key, created, every_min, until_hm)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+    `INSERT INTO items (id, title, date, time, prio, notes, recur, done, done_at, last_done, ack, snooze, notified_key, created, every_min, until_hm, kind)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
      ON CONFLICT(id) DO UPDATE SET
        title = excluded.title, date = excluded.date, time = excluded.time, prio = excluded.prio,
-       every_min = excluded.every_min, until_hm = excluded.until_hm,
+       every_min = excluded.every_min, until_hm = excluded.until_hm, kind = excluded.kind,
        notes = excluded.notes, recur = excluded.recur, done = excluded.done, done_at = excluded.done_at,
        last_done = excluded.last_done, ack = excluded.ack, snooze = excluded.snooze,
        notified_key = excluded.notified_key`
   ).bind(
     id, it.title, it.date, it.time, it.prio, it.notes, JSON.stringify(it.recur),
-    it.done ? 1 : 0, it.doneAt, it.lastDone, it.ack, it.snooze, notifiedKey, created, it.every, it.until
+    it.done ? 1 : 0, it.doneAt, it.lastDone, it.ack, it.snooze, notifiedKey, created, it.every, it.until, it.kind
   ).run();
   return getItem(db, id);
 }
@@ -108,10 +122,10 @@ export async function purgeDone(db, beforeDate) {
   return r.meta?.changes ?? 0;
 }
 
-/** Itens com lembrete até hoje: candidatos a aviso ou a passar para o próximo dia. */
-export async function timedPending(db, localDate) {
+/** Lembretes até hoje: candidatos a aviso ou a passar para o próximo dia. */
+export async function remindersUntil(db, localDate) {
   const { results } = await db.prepare(
-    "SELECT * FROM items WHERE done = 0 AND time <> '' AND date <= ?1 ORDER BY date, time"
+    "SELECT * FROM items WHERE kind = 'reminder' AND done = 0 AND date <= ?1 ORDER BY date, time"
   ).bind(localDate).all();
   return results.map(rowToItem);
 }

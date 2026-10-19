@@ -29,8 +29,6 @@ export function reminderBlocks(it, slot, today, env) {
   const meta = [`⏰ ${slot} · ${dayLabel(it.date, today)}`];
   if (isIntraday(it)) meta.push(`↻ ${everyLabel(it)}`);
   if (isRecurring(it)) meta.push(`↻ ${recurLabel(it.recur)}`);
-  if (it.prio === 2) meta.push("prioridade alta");
-  else if (it.prio === 1) meta.push("prioridade média");
   const blocks = [
     { type: "section", text: { type: "mrkdwn", text: `*${mrkdwn(it.title)}*\n${meta.join(" · ")}${appLink(env)}` } },
   ];
@@ -42,7 +40,7 @@ export function reminderBlocks(it, slot, today, env) {
     type: "actions",
     elements: isIntraday(it)
       ? [btn("slot_done", "Feito", "primary"), btn("snooze_10", "Adiar 10 min"), btn("complete", "Parar por hoje")]
-      : [btn("complete", "Concluir", "primary"), btn("snooze_10", "Adiar 10 min"), btn("snooze_60", "Adiar 1 h")],
+      : [btn("complete", "Feito", "primary"), btn("snooze_10", "Adiar 10 min"), btn("snooze_60", "Adiar 1 h")],
   });
   return blocks;
 }
@@ -56,20 +54,24 @@ export function sendReminder(env, it, slot, today) {
 }
 
 export function sendSummary(env, items, today) {
-  const pending = items.filter(i => !i.done);
-  const late = pending.filter(i => i.date < today);
-  const todays = pending.filter(i => i.date === today)
-    .sort((a, b) => (a.time || "99").localeCompare(b.time || "99") || b.prio - a.prio);
-  const line = i => `• ${i.time ? `\`${i.time}${isIntraday(i) ? `–${i.until}` : ""}\` ` : ""}${mrkdwn(i.title)}${isIntraday(i) ? ` _(${everyLabel(i)})_` : ""}${i.prio === 2 ? " ‼️" : ""}`;
+  const open = items.filter(i => !i.done);
+  const tasks = open.filter(i => i.kind !== "reminder");
+  const late = tasks.filter(i => i.date < today).sort((a, b) => a.date.localeCompare(b.date) || b.prio - a.prio);
+  const due = tasks.filter(i => i.date === today).sort((a, b) => b.prio - a.prio || (a.time || "99").localeCompare(b.time || "99"));
+  const reminders = open.filter(i => i.kind === "reminder" && i.date === today).sort((a, b) => a.time.localeCompare(b.time));
+  const flag = i => (i.prio === 2 ? " ‼️" : i.prio === 1 ? " ❗" : "");
+  const taskLine = i => `• ${mrkdwn(i.title)}${i.time ? ` _(até ${i.time})_` : ""}${flag(i)}`;
+  const lateLine = i => `• ${mrkdwn(i.title)} _(venceu ${dayLabel(i.date, today)})_${flag(i)}`;
+  const remLine = i => `• \`${i.time}${isIntraday(i) ? `–${i.until}` : ""}\` ${mrkdwn(i.title)}${isIntraday(i) ? ` _(${everyLabel(i)})_` : ""}`;
   const [y, m, d] = today.split("-").map(Number);
   const title = fmtDay.format(new Date(Date.UTC(y, m - 1, d)));
   const parts = [`*Bom dia! ${title.charAt(0).toUpperCase() + title.slice(1)}*`];
-  if (todays.length) parts.push(`*Hoje (${todays.length})*\n${todays.map(line).join("\n")}`);
-  else parts.push("Nada marcado para hoje.");
-  if (late.length) parts.push(`*Atrasadas (${late.length})*\n${late.slice(0, 15).map(line).join("\n")}`);
+  if (late.length) parts.push(`*Tarefas atrasadas (${late.length})*\n${late.slice(0, 15).map(lateLine).join("\n")}`);
+  parts.push(due.length ? `*Tarefas que vencem hoje (${due.length})*\n${due.map(taskLine).join("\n")}` : "Nenhuma tarefa vence hoje.");
+  if (reminders.length) parts.push(`*Lembretes de hoje (${reminders.length})*\n${reminders.map(remLine).join("\n")}`);
   return slackApi(env, "chat.postMessage", {
     channel: env.SLACK_USER_ID,
-    text: `Resumo do dia: ${todays.length} para hoje, ${late.length} atrasadas`,
+    text: `Resumo do dia: ${due.length} tarefas vencem hoje, ${late.length} atrasadas, ${reminders.length} lembretes`,
     blocks: [{ type: "section", text: { type: "mrkdwn", text: parts.join("\n\n") + appLink(env) } }],
   });
 }

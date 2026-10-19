@@ -122,7 +122,7 @@ async function init() {
 /* ---------- Ações ---------- */
 function addItem(p) {
   return mutate(null, () => api("/api/items", { method: "POST", body: {
-    title: p.title, date: p.date, time: p.time || "", every: p.every || 0, until: p.until || "",
+    kind: p.kind || "task", title: p.title, date: p.date, time: p.time || "", every: p.every || 0, until: p.until || "",
     prio: p.prio || 0, notes: p.notes || "", recur: normRecur(p.recur, p.date),
   } }));
 }
@@ -135,7 +135,7 @@ function complete(it) {
   mutate(next, () => api(`/api/items/${it.id}/complete`, { method: "POST" })).then(() => {
     if (isRecurring(it)) toast((isIntraday(it) ? "Parado por hoje. Volta " : "Feito. Próxima: ") + relDay(next.date) + (next.time ? " às " + next.time : ""), () => restore(it.id, before));
     else if (isIntraday(it)) toast("Parado. Sem mais avisos deste item.", () => restore(it.id, before));
-    else toast("Concluída", () => restore(it.id, before));
+    else toast(it.kind === "reminder" ? "Lembrete encerrado" : "Tarefa concluída", () => restore(it.id, before));
   }).catch(() => load());
 }
 const action = (it, name, optimistic, body) =>
@@ -179,21 +179,43 @@ function sortDay(a, b) {
   if (b.time) return 1;
   return b.prio - a.prio || (a.created || 0) - (b.created || 0);
 }
+/** Tarefas: prioridade primeiro, depois prazo. */
+function sortTasks(a, b) {
+  return b.prio - a.prio || (a.time || "99").localeCompare(b.time || "99") || (a.created || 0) - (b.created || 0);
+}
+/** Lista de um dia: lembretes pelo horário, depois tarefas. */
+function sortMixed(a, b) {
+  const ra = a.kind === "reminder", rb = b.kind === "reminder";
+  if (ra !== rb) return ra ? -1 : 1;
+  return ra ? sortDay(a, b) : sortTasks(a, b);
+}
 function itemHTML(it, opts = {}) {
-  const meta = [];
-  if (opts.late) { const n = daysLate(it.date); meta.push(`<span class="late">atrasada ${n === 1 ? "desde ontem" : "há " + n + " dias"}</span>`); }
-  if (opts.showDate) meta.push(`<span>${esc(relDay(it.date))}</span>`);
-  if (it.time && !it.done) meta.push(`<span>${ICON.bell}${isIntraday(it) ? esc(everyLabel(it)) : "lembrete"}</span>`);
+  const meta = [], isRem = it.kind === "reminder", t = today();
+  if (!isRem && !it.done && !opts.ghost) {
+    if (it.date < t) {
+      const n = daysLate(it.date);
+      meta.push(`<span class="late">atrasada ${n === 1 ? "desde ontem" : "há " + n + " dias"}</span>`);
+    } else if (opts.inDay) {
+      if (it.time) meta.push(`<span>prazo ${esc(it.time)}</span>`);
+    } else if (it.date === t) {
+      const passed = it.time && it.time <= nowHM();
+      meta.push(`<span class="${passed ? "late" : ""}">${passed ? "venceu" : "vence"} hoje${it.time ? " às " + esc(it.time) : ""}</span>`);
+    } else meta.push(`<span>vence ${esc(relDay(it.date))}${it.time ? " às " + esc(it.time) : ""}</span>`);
+  }
+  if (isRem && opts.showDate) meta.push(`<span>${esc(relDay(it.date))}</span>`);
+  if (isRem && !it.done) meta.push(`<span>${ICON.bell}${isIntraday(it) ? esc(everyLabel(it)) : "lembrete"}</span>`);
   if (isRecurring(it)) meta.push(`<span>${ICON.rep}${esc(recurLabel(it.recur))}</span>`);
-  if (it.lastDone === today() && opts.ghost) meta.push(`<span>feito hoje</span>`);
+  if (it.lastDone === t && opts.ghost) meta.push(`<span>feito hoje</span>`);
   if (it.notes) meta.push(`<span>${ICON.note}nota</span>`);
-  const cls = ["item"];
+  const cls = ["item", isRem ? "is-rem" : "is-task"];
   if (it.prio) cls.push("p" + it.prio);
   if (it.done || opts.ghost) cls.push("done");
   const act = opts.ghost ? "" : (it.done ? "reopen" : "complete");
+  const label = it.done ? "Reabrir" : isRem && isIntraday(it) ? "Parar por hoje" : "Concluir";
+  const when = isRem ? esc(opts.slotTime ? effTime(it) : it.time) : "—";
   return `<li class="${cls.join(" ")}">
-    <button class="check" type="button" data-act="${act}" data-id="${esc(it.id)}" aria-label="${it.done ? "Reabrir" : "Concluir"}: ${esc(it.title)}" ${opts.ghost ? "disabled" : ""}>${ICON.check}</button>
-    <div class="when ${it.time ? "timed" : ""}">${it.time ? esc(opts.slotTime ? effTime(it) : it.time) : "—"}</div>
+    <button class="check" type="button" data-act="${act}" data-id="${esc(it.id)}" aria-label="${label}: ${esc(it.title)}" title="${label}" ${opts.ghost ? "disabled" : ""}>${ICON.check}</button>
+    <div class="when ${isRem ? "timed" : ""}">${when}</div>
     <button class="body" type="button" data-act="edit" data-id="${esc(it.id)}">
       <span class="title">${esc(it.title)}</span>
       ${meta.length ? `<span class="meta">${meta.join("")}</span>` : ""}
@@ -207,57 +229,63 @@ function emptyHTML(title, text) {
 
 function buckets() {
   const t = today(), open = items.filter(i => !i.done);
-  const late = open.filter(i => i.date < t).sort((a, b) => a.date.localeCompare(b.date) || sortDay(a, b));
-  const todayList = open.filter(i => i.date === t).sort(sortDay);
-  const doneToday = items.filter(i => (i.done && i.doneAt && ymd(new Date(i.doneAt)) === t) || (!i.done && isRecurring(i) && i.lastDone === t && i.date !== t));
-  return { late, todayList, doneToday };
+  const tasks = open.filter(i => i.kind !== "reminder"), rems = open.filter(i => i.kind === "reminder");
+  const late = tasks.filter(i => i.date < t).sort((a, b) => a.date.localeCompare(b.date) || sortTasks(a, b));
+  const dueToday = tasks.filter(i => i.date === t).sort(sortTasks);
+  const remToday = rems.filter(i => i.date === t).sort(sortDay);
+  const doneToday = items.filter(i => i.kind !== "reminder" && (
+    (i.done && i.doneAt && ymd(new Date(i.doneAt)) === t) || (!i.done && isRecurring(i) && i.lastDone === t && i.date !== t)));
+  return { late, dueToday, remToday, doneToday };
 }
 function weekOccurrences() {
   const days = [], base = new Date();
   for (let k = 1; k <= 7; k++) {
     const d = addDays(base, k), ds = ymd(d);
-    const list = items.filter(i => !i.done && (isRecurring(i) ? occursOn(i, d) : i.date === ds)).sort(sortDay);
+    const list = items.filter(i => !i.done && (isRecurring(i) ? occursOn(i, d) : i.date === ds)).sort(sortMixed);
     days.push({ ds, d, list });
   }
   return days;
 }
 function renderSummary() {
-  const { late, todayList, doneToday } = buckets(), hm = nowHM();
-  const left = todayList.reduce((n, i) => n + slotsOf(i).filter(x => x > hm).length, 0);
+  const { late, dueToday, remToday, doneToday } = buckets(), hm = nowHM();
+  const left = remToday.reduce((n, i) => n + slotsOf(i).filter(x => x > hm).length, 0);
+  const pl = (n, one, many) => `<b>${n}</b> ${n === 1 ? one : many}`;
   $("#summary").innerHTML = !loaded ? "" : [
-    late.length ? `<span class="stat late"><b>${late.length}</b> atrasada${late.length > 1 ? "s" : ""}</span>` : "",
-    `<span class="stat"><b>${todayList.length}</b> para hoje</span>`,
-    `<span class="stat"><b>${left}</b> lembrete${left === 1 ? "" : "s"} restante${left === 1 ? "" : "s"}</span>`,
-    `<span class="stat ok"><b>${doneToday.length}</b> feita${doneToday.length === 1 ? "" : "s"} hoje</span>`,
+    late.length ? `<span class="stat late">${pl(late.length, "tarefa atrasada", "tarefas atrasadas")}</span>` : "",
+    `<span class="stat">${pl(dueToday.length, "tarefa para hoje", "tarefas para hoje")}</span>`,
+    `<span class="stat">${pl(left, "aviso restante", "avisos restantes")}</span>`,
+    `<span class="stat ok">${pl(doneToday.length, "feita hoje", "feitas hoje")}</span>`,
   ].join("");
-  $("#nToday").textContent = loaded ? (late.length + todayList.length || "") : "";
+  $("#nToday").textContent = loaded ? (late.length + dueToday.length + remToday.length || "") : "";
   const wk = weekOccurrences().reduce((n, d) => n + d.list.length, 0);
   $("#nWeek").textContent = loaded && wk ? wk : "";
   const all = items.filter(i => !i.done).length;
   $("#nAll").textContent = loaded && all ? all : "";
 }
 function renderToday() {
-  const { late, todayList, doneToday } = buckets(), hm = nowHM();
+  const { late, dueToday, remToday, doneToday } = buckets(), hm = nowHM();
+  const group = (title, aux, rows, cls = "") =>
+    `<section class="group"><div class="group-h"><h2 class="${cls}">${title}</h2><span class="aux">${aux}</span></div><ul class="list">${rows}</ul></section>`;
   let html = "";
-  if (late.length) html += `<section class="group"><div class="group-h"><h2 class="late">Atrasadas</h2><span class="aux">${late.length}</span></div><ul class="list">${late.map(i => itemHTML(i, { late: true })).join("")}</ul></section>`;
-  if (todayList.length) {
-    const timed = todayList.filter(i => i.time), untimed = todayList.filter(i => !i.time);
+  if (late.length) html += group("Tarefas atrasadas", late.length, late.map(i => itemHTML(i, { notes: true })).join(""), "late");
+  if (dueToday.length) html += group("Tarefas de hoje", dueToday.length, dueToday.map(i => itemHTML(i, { notes: true })).join(""));
+  if (remToday.length) {
     const nowRow = `<li class="nowline" aria-label="Agora ${hm}"><span class="nl-dot"></span><span class="nl-t">${hm}</span><span class="nl-bar"></span></li>`;
     let rows = "", placed = false;
-    for (const i of timed) {
+    for (const i of remToday) {
       if (!placed && effTime(i) > hm) { rows += nowRow; placed = true; }
       rows += itemHTML(i, { notes: true, slotTime: true });
     }
-    if (timed.length && !placed) rows += nowRow;
-    rows += untimed.map(i => itemHTML(i, { notes: true })).join("");
-    html += `<section class="group"><div class="group-h"><h2>Hoje</h2><span class="aux">${timed.length} com horário · ${untimed.length} sem</span></div><ul class="list">${rows}</ul></section>`;
+    if (!placed) rows += nowRow;
+    const left = remToday.reduce((n, i) => n + slotsOf(i).filter(x => x > hm).length, 0);
+    html += group("Lembretes de hoje", `${left} aviso${left === 1 ? "" : "s"} restante${left === 1 ? "" : "s"}`, rows);
   }
-  if (!late.length && !todayList.length) {
-    html += items.length
-      ? emptyHTML("Dia livre", doneToday.length ? "Tudo de hoje está feito. Adicione algo acima ou veja os próximos dias." : "Nada marcado para hoje. Adicione uma tarefa acima ou veja os próximos dias.")
-      : emptyHTML("Comece pelo que precisa lembrar hoje", "Escreva a tarefa acima e escolha o dia. Com hora, ela vira lembrete. Também dá para definir prioridade e repetição.");
+  if (!html) {
+    html = items.length
+      ? emptyHTML("Dia livre", doneToday.length ? "Tudo de hoje está feito. Adicione algo acima ou veja os próximos dias." : "Nada vence nem avisa hoje. Adicione algo acima ou veja os próximos dias.")
+      : emptyHTML("Comece pelo que precisa fazer ou lembrar", "Tarefa tem data de vencimento e aparece no resumo diário até ser concluída. Lembrete avisa num horário, uma vez ou várias vezes no dia.");
   }
-  if (doneToday.length) html += `<details class="donebox"><summary>Feitas hoje · ${doneToday.length}</summary><ul class="list">${doneToday.map(i => itemHTML(i, { ghost: !i.done })).join("")}</ul></details>`;
+  if (doneToday.length) html += `<details class="donebox"><summary>Tarefas feitas hoje · ${doneToday.length}</summary><ul class="list">${doneToday.map(i => itemHTML(i, { ghost: !i.done })).join("")}</ul></details>`;
   return html;
 }
 function renderWeek() {
@@ -265,19 +293,25 @@ function renderWeek() {
   if (!days.some(d => d.list.length)) return emptyHTML("Semana em branco", "Nada marcado para os próximos 7 dias.");
   return days.filter(d => d.list.length).map(({ ds, d, list }) => {
     const label = ds === ymd(addDays(new Date(), 1)) ? "Amanhã" : fmtWeekday.format(d);
-    return `<section class="group"><div class="group-h"><h2>${esc(label)}</h2><span class="aux">${esc(fmtLong.format(d))}</span></div><ul class="list">${list.map(i => itemHTML(i)).join("")}</ul></section>`;
+    return `<section class="group"><div class="group-h"><h2>${esc(label)}</h2><span class="aux">${esc(fmtLong.format(d))}</span></div><ul class="list">${list.map(i => itemHTML(i, { inDay: true })).join("")}</ul></section>`;
   }).join("");
 }
 function renderAllView() {
-  const open = items.filter(i => !i.done);
-  const rec = open.filter(isRecurring).sort((a, b) => a.title.localeCompare(b.title, "pt-BR"));
-  const once = open.filter(i => !isRecurring(i)).sort((a, b) => a.date.localeCompare(b.date) || sortDay(a, b));
-  const doneOld = items.filter(i => i.done && i.doneAt && ymd(new Date(i.doneAt)) < today());
-  let html = "";
-  if (rec.length) html += `<section class="group"><div class="group-h"><h2>Recorrentes</h2><span class="aux">${rec.length}</span></div><ul class="list">${rec.map(i => itemHTML(i, { showDate: true })).join("")}</ul></section>`;
-  if (once.length) html += `<section class="group"><div class="group-h"><h2>Agendadas</h2><span class="aux">${once.length}</span></div><ul class="list">${once.map(i => itemHTML(i, { showDate: true, late: i.date < today() })).join("")}</ul></section>`;
-  if (!html) html = emptyHTML("Nada pendente", "Tudo o que você adicionar aparece aqui, separado entre recorrentes e agendadas.");
-  if (doneOld.length) html += `<div class="footer-tools"><span class="hint">${doneOld.length} concluída${doneOld.length > 1 ? "s" : ""} de dias anteriores</span><button class="btn" type="button" id="purgeBtn">Limpar concluídas</button></div>`;
+  const open = items.filter(i => !i.done), t = today();
+  const byDate = (a, b) => a.date.localeCompare(b.date) || sortMixed(a, b);
+  const byTitle = (a, b) => a.title.localeCompare(b.title, "pt-BR");
+  const tasks = open.filter(i => i.kind !== "reminder"), rems = open.filter(i => i.kind === "reminder");
+  const sections = [
+    ["Tarefas", tasks.filter(i => !isRecurring(i)).sort(byDate)],
+    ["Tarefas recorrentes", tasks.filter(isRecurring).sort(byTitle)],
+    ["Lembretes", rems.filter(i => !isRecurring(i)).sort(byDate)],
+    ["Lembretes recorrentes", rems.filter(isRecurring).sort(byTitle)],
+  ];
+  let html = sections.filter(([, list]) => list.length).map(([title, list]) =>
+    `<section class="group"><div class="group-h"><h2>${title}</h2><span class="aux">${list.length}</span></div><ul class="list">${list.map(i => itemHTML(i, { showDate: true })).join("")}</ul></section>`).join("");
+  if (!html) html = emptyHTML("Nada pendente", "Tudo o que você adicionar aparece aqui, separado em tarefas e lembretes.");
+  const doneOld = items.filter(i => i.done && i.doneAt && ymd(new Date(i.doneAt)) < t);
+  if (doneOld.length) html += `<div class="footer-tools"><span class="hint">${doneOld.length} concluído${doneOld.length > 1 ? "s" : ""} de dias anteriores</span><button class="btn" type="button" id="purgeBtn">Limpar concluídos</button></div>`;
   return html;
 }
 function renderView() {
@@ -345,7 +379,7 @@ $("#notifBtn").addEventListener("click", async () => {
 function dueAlerts() {
   const now = new Date(), ts = ymd(now);
   return items.filter(it => {
-    if (!it.time || it.done || it.date > ts) return false;
+    if (it.kind !== "reminder" || !it.time || it.done || it.date !== ts) return false;
     const at = parseYmd(it.date);
     const [h, m] = it.time.split(":").map(Number);
     at.setHours(h, m, 0, 0);
@@ -366,9 +400,8 @@ function renderAlerts() {
         <button type="button" class="primary" data-act="dismiss" data-id="${esc(it.id)}">Feito</button>
         <button type="button" data-act="snooze" data-id="${esc(it.id)}">Adiar 10 min</button>
         <button type="button" data-act="complete" data-id="${esc(it.id)}">Parar por hoje</button>` : `
-        <button type="button" class="primary" data-act="complete" data-id="${esc(it.id)}">Concluir</button>
-        <button type="button" data-act="snooze" data-id="${esc(it.id)}">Adiar 10 min</button>
-        <button type="button" data-act="dismiss" data-id="${esc(it.id)}">Dispensar</button>`}
+        <button type="button" class="primary" data-act="complete" data-id="${esc(it.id)}">Feito</button>
+        <button type="button" data-act="snooze" data-id="${esc(it.id)}">Adiar 10 min</button>`}
       </span></div>`).join("");
   let fresh = false;
   for (const it of list) {
@@ -395,12 +428,22 @@ document.addEventListener("visibilitychange", () => { if (document.visibilitySta
 const RECUR_OPTS = [["none", "Não repete"], ["daily", "Todo dia"], ["weekdays", "Dias úteis (seg–sex)"], ["weekly", "Toda semana"], ["monthly", "Todo mês"]];
 const PRIOS = [[0, "Normal"], [1, "Média"], [2, "Alta"]];
 const EVERY_OPTS = [[0, "Só uma vez"], [15, "A cada 15 min"], [30, "A cada 30 min"], [60, "A cada 1 h"], [90, "A cada 1 h 30"], [120, "A cada 2 h"], [180, "A cada 3 h"], [240, "A cada 4 h"]];
+const KINDS = [["task", "Tarefa"], ["reminder", "Lembrete"]];
+const KIND_TEXT = {
+  task: { date: "Vence em", time: "Hora limite (opcional)", placeholder: "O que você precisa fazer?" },
+  reminder: { date: "Dia", time: "Hora do aviso", placeholder: "Do que você quer ser lembrado?" },
+};
+
+function kindHTML(p) {
+  return `<div class="seg kind-seg" role="radiogroup" aria-label="Tipo">${KINDS.map(([v, l]) =>
+    `<label><input type="radio" name="${p}-kind" id="${p}-k-${v}" value="${v}"><span>${l}</span></label>`).join("")}</div>`;
+}
 
 function fieldsHTML(p, { notesCollapsed }) {
   const notes = `<textarea id="${p}-notes" maxlength="4000" aria-label="Notas"></textarea>`;
   return `
     <div class="fields">
-      <div class="field f-date"><label for="${p}-date">Dia</label>
+      <div class="field f-date"><label for="${p}-date" id="${p}-dateLbl">Dia</label>
         <div class="date-row">
           <input id="${p}-date" type="date" required>
           <div class="quick-days">
@@ -409,17 +452,17 @@ function fieldsHTML(p, { notesCollapsed }) {
           </div>
         </div>
       </div>
-      <div class="field"><label for="${p}-time">Hora do lembrete</label><input id="${p}-time" type="time"></div>
-      <div class="field"><span class="lbl">Prioridade</span>
+      <div class="field"><label for="${p}-time" id="${p}-timeLbl">Hora</label><input id="${p}-time" type="time"></div>
+      <div class="field" id="${p}-prioField"><span class="lbl">Prioridade</span>
         <div class="seg">${PRIOS.map(([v, l]) => `<label><input type="radio" name="${p}-prio" id="${p}-p${v}" value="${v}"><span>${l}</span></label>`).join("")}</div>
       </div>
       <div class="field f-recur"><label for="${p}-recur">Repetir em dias</label>
         <select id="${p}-recur">${RECUR_OPTS.map(([v, l]) => `<option value="${v}">${l}</option>`).join("")}</select>
       </div>
-      <div class="field"><label for="${p}-every">Avisos no dia</label>
+      <div class="field" id="${p}-everyField"><label for="${p}-every">Avisos no dia</label>
         <select id="${p}-every">${EVERY_OPTS.map(([v, l]) => `<option value="${v}">${l}</option>`).join("")}</select>
       </div>
-      <div class="field"><label for="${p}-until">Até</label><input id="${p}-until" type="time"></div>
+      <div class="field" id="${p}-untilField"><label for="${p}-until">Até</label><input id="${p}-until" type="time"></div>
     </div>
     <div class="form-extra">
       <div class="field" id="${p}-daysField" hidden><span class="lbl">Dias da semana</span>
@@ -434,25 +477,29 @@ function fieldsHTML(p, { notesCollapsed }) {
 
 const fld = (p, name) => $(`#${p}-${name}`);
 const checkedDays = p => [1, 2, 3, 4, 5, 6, 0].filter(w => fld(p, "d" + w).checked);
+const kindOf = p => document.querySelector(`input[name="${p}-kind"]:checked`)?.value || "task";
 
 function readFields(p) {
+  const kind = kindOf(p);
   const date = fld(p, "date").value || today();
   const t = fld(p, "recur").value;
   const recur = normRecur({ t, days: t === "weekly" ? checkedDays(p) : undefined }, date);
   const time = fld(p, "time").value || "";
-  const every = time ? +fld(p, "every").value : 0;
+  const every = kind === "reminder" && time ? +fld(p, "every").value : 0;
   return {
+    kind,
     date: alignDate(recur, date),
     time,
     every,
     until: every ? fld(p, "until").value || "" : "",
-    prio: +(document.querySelector(`input[name="${p}-prio"]:checked`)?.value || 0),
+    prio: kind === "task" ? +(document.querySelector(`input[name="${p}-prio"]:checked`)?.value || 0) : 0,
     notes: fld(p, "notes").value.trim(),
     recur,
   };
 }
 
 function writeFields(p, src) {
+  fld(p, "k-" + (src.kind === "reminder" ? "reminder" : "task")).checked = true;
   fld(p, "date").value = src.date || today();
   fld(p, "time").value = src.time || "";
   fld(p, "every").value = String(src.every || 0);
@@ -467,10 +514,24 @@ function writeFields(p, src) {
   syncFields(p);
 }
 
-/** Mostra os dias da semana quando precisa e resume em uma frase o que vai ser salvo. */
+/** Problema que impede salvar, ou null. */
+function formError(v) {
+  if (v.kind === "reminder" && !v.time) return "Escolha a hora do aviso.";
+  if (v.every && (!v.until || v.until <= v.time)) return "Em \"Até\", escolha um horário depois do início.";
+  return null;
+}
+
+/** Mostra só os campos do tipo escolhido e resume em uma frase o que vai ser salvo. */
 function syncFields(p) {
-  const t = fld(p, "recur").value;
-  fld(p, "daysField").hidden = t !== "weekly";
+  const kind = kindOf(p), isRem = kind === "reminder", text = KIND_TEXT[kind];
+  fld(p, "dateLbl").textContent = text.date;
+  fld(p, "timeLbl").textContent = text.time;
+  fld(p, "time").required = isRem;
+  fld(p, "prioField").hidden = isRem;
+  fld(p, "everyField").hidden = !isRem;
+  fld(p, "untilField").hidden = !isRem;
+  if (p === "q") $("#quick").placeholder = text.placeholder;
+  fld(p, "daysField").hidden = fld(p, "recur").value !== "weekly";
   const date = fld(p, "date").value;
   document.querySelectorAll(`[data-form="${p}"][data-setday]`).forEach(b => {
     b.setAttribute("aria-pressed", String(date === ymd(addDays(new Date(), +b.dataset.setday))));
@@ -478,24 +539,35 @@ function syncFields(p) {
   const hasTime = !!fld(p, "time").value, every = +fld(p, "every").value;
   fld(p, "every").disabled = !hasTime;
   fld(p, "until").disabled = !hasTime || !every;
-  if (!date) { fld(p, "summary").textContent = "Escolha um dia."; return; }
-  const v = readFields(p);
-  let when = v.time ? ` às <b>${esc(v.time)}</b>, com lembrete` : ", sem lembrete";
-  if (v.every) {
-    if (!v.until || v.until <= v.time) {
-      fld(p, "summary").textContent = "Escolha em \"Até\" um horário depois do início.";
-      return;
-    }
-    const n = slotsOf(v).length, slots = slotsOf(v);
-    when = `, <b>${esc(everyLabel(v).replace(/ até .*/, ""))}</b> das ${esc(v.time)} às ${esc(slots[slots.length - 1])} (<b>${n}</b> aviso${n === 1 ? "" : "s"} por dia)`;
+  const out = fld(p, "summary");
+  if (!date) { out.textContent = "Escolha um dia."; return; }
+  const v = readFields(p), err = formError(v);
+  if (err) { out.textContent = err; return; }
+  const day = `<b>${esc(relDay(v.date))}</b>`;
+  if (!isRem) {
+    const limit = v.time ? ` até as <b>${esc(v.time)}</b>` : "";
+    out.innerHTML = v.recur.t === "none"
+      ? `Vence ${day}${limit}. Aparece no resumo diário até ser concluída.`
+      : `Repete <b>${esc(recurLabel(v.recur))}</b>. Próximo vencimento: ${day}${limit}.`;
+    return;
   }
-  fld(p, "summary").innerHTML = v.recur.t === "none"
-    ? `Para <b>${esc(relDay(v.date))}</b>${when}.`
-    : `Repete <b>${esc(recurLabel(v.recur))}</b>${when}. Próxima: <b>${esc(relDay(v.date))}</b>.`;
+  let when = ` às <b>${esc(v.time)}</b>`;
+  if (v.every) {
+    const slots = slotsOf(v), n = slots.length;
+    when = `, <b>${esc(everyLabel(v).replace(/ até .*/, ""))}</b> das ${esc(v.time)} às ${esc(slots[n - 1])} (<b>${n}</b> aviso${n === 1 ? "" : "s"} por dia)`;
+  }
+  out.innerHTML = v.recur.t === "none"
+    ? `Avisa ${day}${when}.`
+    : `Avisa <b>${esc(recurLabel(v.recur))}</b>${when}. Próximo: ${day}.`;
 }
 
-function mountFields(p, container, opts) {
+function mountFields(p, kindBox, container, opts) {
+  kindBox.innerHTML = kindHTML(p);
   container.innerHTML = fieldsHTML(p, opts);
+  kindBox.addEventListener("change", () => {
+    if (p === "q") { try { localStorage.setItem("meudia.kind", kindOf(p)); } catch {} }
+    syncFields(p);
+  });
   container.addEventListener("input", () => syncFields(p));
   container.addEventListener("change", e => {
     if (e.target === fld(p, "every") && +fld(p, "every").value && !fld(p, "until").value) {
@@ -515,29 +587,31 @@ function mountFields(p, container, opts) {
   });
 }
 
-const BLANK = { date: "", time: "", prio: 0, notes: "", recur: { t: "none" } };
+function lastKind() { try { return localStorage.getItem("meudia.kind") === "reminder" ? "reminder" : "task"; } catch { return "task"; } }
+const blank = () => ({ kind: lastKind(), date: today(), time: "", prio: 0, notes: "", recur: { t: "none" } });
 
 /* ---------- Adicionar ---------- */
 const quick = $("#quick");
-mountFields("q", $("#qFields"), { notesCollapsed: true });
-writeFields("q", { ...BLANK, date: today() });
+mountFields("q", $("#qKind"), $("#qFields"), { notesCollapsed: true });
+writeFields("q", blank());
 quick.addEventListener("input", () => { $("#addBtn").disabled = !quick.value.trim(); });
 $("#composer").addEventListener("submit", e => {
   e.preventDefault();
   const title = quick.value.trim();
   if (!title) { quick.focus(); return; }
-  const data = { title, ...readFields("q") };
-  if (data.every && (!data.until || data.until <= data.time)) { toast("Em \"Até\", escolha um horário depois do início."); fld("q", "until").focus(); return; }
+  const data = { title, ...readFields("q") }, err = formError(data);
+  if (err) { toast(err); fld("q", data.kind === "reminder" && !data.time ? "time" : "until").focus(); return; }
   quick.value = ""; $("#addBtn").disabled = true;
-  writeFields("q", { ...BLANK, date: today() });
+  writeFields("q", blank());
   quick.focus();
-  addItem(data).then(() => toast(`Adicionado para ${relDay(data.date)}${data.time ? " às " + data.time : ""}`))
+  const what = data.kind === "reminder" ? `Lembrete para ${relDay(data.date)} às ${data.time}` : `Tarefa para ${relDay(data.date)}`;
+  addItem(data).then(() => toast(`${what} adicionado${data.kind === "reminder" ? "" : "a"}`))
     .catch(() => { quick.value = title; $("#addBtn").disabled = false; writeFields("q", data); });
 });
 
 /* ---------- Editor ---------- */
 let editing = null, delArmed = false;
-mountFields("f", $("#fFields"), { notesCollapsed: false });
+mountFields("f", $("#fKind"), $("#fFields"), { notesCollapsed: false });
 function openEditor(it) {
   editing = it; delArmed = false;
   $("#f-title").value = it.title || "";
@@ -564,9 +638,10 @@ $("#editor").addEventListener("submit", e => {
   e.preventDefault();
   const title = $("#f-title").value.trim();
   if (!title || !editing) return;
-  const prev = editing, data = { title, ...readFields("f") };
-  if (data.every && (!data.until || data.until <= data.time)) { toast("Em \"Até\", escolha um horário depois do início."); fld("f", "until").focus(); return; }
-  const changedWhen = prev.date !== data.date || prev.time !== data.time || (prev.every || 0) !== data.every || (prev.until || "") !== data.until;
+  const prev = editing, data = { title, ...readFields("f") }, err = formError(data);
+  if (err) { toast(err); return; }
+  const changedWhen = prev.kind !== data.kind || prev.date !== data.date || prev.time !== data.time
+    || (prev.every || 0) !== data.every || (prev.until || "") !== data.until;
   const body = { ...strip(prev), ...data, ...(changedWhen ? { ack: "", snooze: 0 } : {}) };
   mutate({ ...prev, ...body }, () => api("/api/items/" + prev.id, { method: "PUT", body })).then(() => toast("Salvo")).catch(() => load());
   closeEditor();

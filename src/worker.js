@@ -2,8 +2,8 @@ import { completedState, lastSlotKey, nextSlot, isIntraday, isRecurring, firstOn
 import { isAuthorized, sameOrigin, login, logoutCookie } from "./auth.js";
 import { localNow } from "./time.js";
 import {
-  ValidationError, cleanInput, notifiedKeyFor, listItems, getItem, saveItem, deleteItem,
-  purgeDone, timedPending, pendingSlotKey, markNotified, getMeta, setMeta,
+  ValidationError, cleanInput, notifiedKeyFor, skipPassedSlots, listItems, getItem, saveItem, deleteItem,
+  purgeDone, remindersUntil, pendingSlotKey, markNotified, getMeta, setMeta,
 } from "./items.js";
 import { slackEnabled, sendReminder, sendSummary, verifySlack, replaceMessage } from "./slack.js";
 
@@ -30,7 +30,7 @@ async function api(request, env, path) {
   }
   if (path === "/api/items" && method === "GET") return json({ items: await listItems(db) });
   if (path === "/api/items" && method === "POST") {
-    const it = cleanInput(await readJson(request));
+    const it = skipPassedSlots(cleanInput(await readJson(request)), null, local);
     return json({ item: await saveItem(db, newId(), it, notifiedKeyFor(it, null, local), Date.now()) }, 201);
   }
   if (path === "/api/items/purge-done" && method === "POST") {
@@ -44,7 +44,7 @@ async function api(request, env, path) {
   if (!prev) return fail(404, "Item não encontrado. Ele pode ter sido excluído em outro aparelho.");
 
   if (!action && method === "PUT") {
-    const it = cleanInput(await readJson(request));
+    const it = skipPassedSlots(cleanInput(await readJson(request)), prev, local);
     return json({ item: await saveItem(db, id, it, notifiedKeyFor(it, prev, local), prev.created) });
   }
   if (!action && method === "DELETE") { await deleteItem(db, id); return json({ ok: true }); }
@@ -80,7 +80,7 @@ async function slackInteraction(request, env, ctx) {
   else if (action.action_id === "complete") {
     const it = cleanInput(completedState(prev, local.date, new Date().toISOString()));
     await saveItem(db, prev.id, it, notifiedKeyFor(it, prev, local), prev.created);
-    const label = isIntraday(prev) ? "⏹ Parado por hoje" : "✅ Feito hoje";
+    const label = isIntraday(prev) ? "⏹ Parado por hoje" : "✅ Feito";
     text = it.done ? `✅ Concluído · ~${prev.title}~` : `${label} · ${prev.title}\nPróxima: ${it.date}${it.time ? " às " + it.time : ""}`;
   } else if (action.action_id === "slot_done") {
     const it = cleanInput({ ...prev, ack: currentKey(prev, local), snooze: 0 });
@@ -103,10 +103,12 @@ async function tick(env) {
   const db = env.DB, local = localNow(env.TZ), slack = slackEnabled(env);
 
   let sent = 0;
-  for (const it of await timedPending(db, local.date)) {
-    // Lembrete que repete no dia e entre dias passa sozinho para o próximo dia, sem virar "atrasado".
-    if (isIntraday(it) && isRecurring(it) && it.date < local.date) {
-      const next = cleanInput({ ...it, date: firstOnOrAfter(it.recur, local.date), ack: "", snooze: 0 });
+  for (const it of await remindersUntil(db, local.date)) {
+    // Lembrete de dia que já passou não fica "atrasado": se repete, vai para a próxima data; senão, encerra.
+    if (it.date < local.date) {
+      const next = skipPassedSlots(cleanInput(isRecurring(it)
+        ? { ...it, date: firstOnOrAfter(it.recur, local.date), ack: "", snooze: 0 }
+        : { ...it, done: true, doneAt: new Date().toISOString() }), it, local);
       await saveItem(db, it.id, next, notifiedKeyFor(next, null, local), it.created);
       continue;
     }

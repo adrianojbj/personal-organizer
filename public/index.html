@@ -87,6 +87,8 @@ h1 .mark{background:linear-gradient(transparent 52%,var(--hi) 52%,var(--hi) 92%,
 .btn.primary:disabled{opacity:.45;cursor:default}
 .btn.ghost{border-color:transparent;background:transparent;color:var(--ink-2)}
 .btn.danger{color:var(--late)}
+.kind-seg{width:max-content;max-width:100%}
+.kind-seg label{padding:7px 16px;font-weight:500}
 .composer>#qFields{border-top:1px solid var(--rule);padding-top:12px}
 .fields{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,1fr) minmax(0,1.3fr);gap:12px 14px}
 .fields>.field{min-width:0}
@@ -200,6 +202,7 @@ details.donebox ul{margin-top:6px}
   <div class="alerts" id="alerts" aria-live="polite"></div>
 
   <form class="composer" id="composer" autocomplete="off">
+    <div id="qKind"></div>
     <div class="composer-row">
       <input id="quick" placeholder="O que você precisa fazer?" aria-label="Nova tarefa ou lembrete" maxlength="200">
       <button type="submit" class="btn primary" id="addBtn" disabled>Adicionar</button>
@@ -238,6 +241,7 @@ details.donebox ul{margin-top:6px}
 <div class="scrim" id="scrim" hidden>
   <form class="sheet" id="editor" autocomplete="off">
     <h3 id="edTitle">Editar</h3>
+    <div id="fKind"></div>
     <div class="field"><label for="f-title">O quê</label><input id="f-title" required maxlength="200"></div>
     <div id="fFields"></div>
     <div class="sheet-actions">

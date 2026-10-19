@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { cleanInput, notifiedKeyFor, pendingSlotKey, ValidationError } from "../src/items.js";
+import { cleanInput, notifiedKeyFor, pendingSlotKey, skipPassedSlots, ValidationError } from "../src/items.js";
 import { verifySlack } from "../src/slack.js";
 import { localNow } from "../src/time.js";
 
@@ -15,35 +15,48 @@ test("valida a entrada da API", () => {
 
 const at = key => ({ date: key.slice(0, 10), hm: key.slice(11), key });
 
+test("tarefa e lembrete: cada tipo guarda só o que faz sentido", () => {
+  const task = cleanInput({ title: "relatório", date: "2026-10-19", time: "18:00", prio: 2, snooze: 123, ack: "x" });
+  assert.equal(task.kind, "task");
+  assert.equal(task.time, "18:00"); // hora limite
+  assert.equal(task.prio, 2);
+  assert.equal(task.snooze, 0);
+  assert.equal(task.ack, "");
+  assert.throws(() => cleanInput({ kind: "reminder", title: "remédio", date: "2026-10-19" }), ValidationError);
+  const rem = cleanInput({ kind: "reminder", title: "remédio", date: "2026-10-19", time: "08:00", prio: 2 });
+  assert.equal(rem.prio, 0);
+});
+
 test("lembrete criado com horário já passado não vai para o Slack", () => {
   const local = at("2026-10-19T15:00");
-  assert.equal(notifiedKeyFor({ date: "2026-10-19", time: "09:00" }, null, local), "2026-10-19T09:00");
-  assert.equal(notifiedKeyFor({ date: "2026-10-19", time: "16:00" }, null, local), "");
-  assert.equal(notifiedKeyFor({ date: "2026-10-19", time: "" }, null, local), "");
+  const r = { kind: "reminder", date: "2026-10-19" };
+  assert.equal(notifiedKeyFor({ ...r, time: "09:00" }, null, local), "2026-10-19T09:00");
+  assert.equal(notifiedKeyFor({ ...r, time: "16:00" }, null, local), "");
+  assert.equal(notifiedKeyFor({ kind: "task", date: "2026-10-19", time: "09:00" }, null, local), "");
 });
 
 test("adiar libera um novo envio", () => {
-  const prev = { date: "2026-10-19", time: "09:00", snooze: 0, notifiedKey: "2026-10-19T09:00" };
+  const prev = { kind: "reminder", date: "2026-10-19", time: "09:00", snooze: 0, notifiedKey: "2026-10-19T09:00" };
   const next = { ...prev, snooze: Date.now() + 600000 };
   assert.equal(notifiedKeyFor(next, prev, at("2026-10-19T09:05")), "");
   assert.equal(notifiedKeyFor({ ...prev }, prev, at("2026-10-19T09:05")), "2026-10-19T09:00");
 });
 
 test("avisos no dia: valida intervalo e horário final", () => {
-  const base = { title: "água", date: "2026-10-19", time: "09:00" };
+  const base = { kind: "reminder", title: "água", date: "2026-10-19", time: "09:00" };
   assert.throws(() => cleanInput({ ...base, every: 120, until: "08:00" }), ValidationError);
   assert.throws(() => cleanInput({ ...base, every: 2, until: "20:00" }), ValidationError);
   assert.throws(() => cleanInput({ ...base, every: 5, until: "23:59" }), ValidationError); // mais de 96 avisos
   const it = cleanInput({ ...base, every: 120, until: "20:00" });
   assert.equal(it.every, 120);
   assert.equal(it.until, "20:00");
-  const noTime = cleanInput({ ...base, time: "", every: 120, until: "20:00" });
-  assert.equal(noTime.every, 0);
-  assert.equal(noTime.until, "");
+  const task = cleanInput({ ...base, kind: "task", every: 120, until: "20:00" });
+  assert.equal(task.every, 0);
+  assert.equal(task.until, "");
 });
 
 test("avisos no dia: cada horário sai uma vez, na hora certa", () => {
-  const it = { date: "2026-10-19", time: "09:00", every: 120, until: "20:00", ack: "", snooze: 0, notifiedKey: "" };
+  const it = { kind: "reminder", date: "2026-10-19", time: "09:00", every: 120, until: "20:00", ack: "", snooze: 0, notifiedKey: "" };
   // criado às 10:30: o aviso das 09:00 já passou e não é enviado
   it.notifiedKey = notifiedKeyFor(it, null, at("2026-10-19T10:30"));
   assert.equal(it.notifiedKey, "2026-10-19T09:00");
@@ -98,4 +111,12 @@ test("login por senha: sessão válida, senha errada e bloqueio", async () => {
 
   for (let i = 0; i < 5; i++) assert.equal((await login(req("errada"), env, db)).status, 401);
   assert.equal((await login(req("correta"), env, db)).status, 429);
+});
+
+test("lembrete criado no meio do dia não mostra na página os horários que já passaram", () => {
+  const it = { kind: "reminder", date: "2026-10-19", time: "09:00", every: 120, until: "20:00", ack: "" };
+  assert.equal(skipPassedSlots(it, null, at("2026-10-19T15:18")).ack, "2026-10-19T15:00");
+  assert.equal(skipPassedSlots(it, null, at("2026-10-19T08:00")).ack, "");
+  assert.equal(skipPassedSlots({ ...it, ack: "old" }, { ...it }, at("2026-10-19T15:18")).ack, "old"); // mesma programação: não mexe
+  assert.equal(skipPassedSlots({ ...it, kind: "task" }, null, at("2026-10-19T15:18")).ack, "");
 });
