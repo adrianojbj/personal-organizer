@@ -23,6 +23,7 @@ crons = ["* * * * *"]
 TZ = "America/Sao_Paulo"
 DAILY_SUMMARY_TIME = "08:00"   # resumo diário no Slack; deixe "" para desligar
 APP_URL = "https://meu-dia.adrianojbj.workers.dev"
+SLACK_INTERACTIVE = "true"     # botões Concluir/Adiar nas DMs (o Slack chama /slack/interactions)
 
 # Segredos (nunca no git), via `npx wrangler secret put NOME`:
 #   APP_PASSWORD, SESSION_SECRET (login)

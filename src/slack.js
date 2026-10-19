@@ -1,4 +1,4 @@
-import { recurLabel, isRecurring, parseYmd, addDays, ymd } from "../public/lib/agenda.js";
+import { recurLabel, isRecurring, isIntraday, everyLabel, parseYmd, addDays, ymd } from "../public/lib/agenda.js";
 
 export const slackEnabled = env => !!(env.SLACK_BOT_TOKEN && env.SLACK_USER_ID);
 
@@ -25,8 +25,9 @@ async function slackApi(env, method, body) {
 
 const appLink = env => (env.APP_URL ? ` · <${env.APP_URL}|Abrir Meu Dia>` : "");
 
-export function reminderBlocks(it, today, env) {
-  const meta = [`⏰ ${it.time} · ${dayLabel(it.date, today)}`];
+export function reminderBlocks(it, slot, today, env) {
+  const meta = [`⏰ ${slot} · ${dayLabel(it.date, today)}`];
+  if (isIntraday(it)) meta.push(`↻ ${everyLabel(it)}`);
   if (isRecurring(it)) meta.push(`↻ ${recurLabel(it.recur)}`);
   if (it.prio === 2) meta.push("prioridade alta");
   else if (it.prio === 1) meta.push("prioridade média");
@@ -36,22 +37,21 @@ export function reminderBlocks(it, today, env) {
   if (it.notes) blocks.push({ type: "context", elements: [{ type: "mrkdwn", text: mrkdwn(it.notes.slice(0, 500)) }] });
   // Botões exigem que o Slack alcance /slack/interactions (URL pública).
   if (env.SLACK_INTERACTIVE !== "true") return blocks;
+  const btn = (action_id, text, style) => ({ type: "button", action_id, value: it.id, text: { type: "plain_text", text }, ...(style ? { style } : {}) });
   blocks.push({
     type: "actions",
-    elements: [
-      { type: "button", action_id: "complete", value: it.id, style: "primary", text: { type: "plain_text", text: "Concluir" } },
-      { type: "button", action_id: "snooze_10", value: it.id, text: { type: "plain_text", text: "Adiar 10 min" } },
-      { type: "button", action_id: "snooze_60", value: it.id, text: { type: "plain_text", text: "Adiar 1 h" } },
-    ],
+    elements: isIntraday(it)
+      ? [btn("slot_done", "Feito", "primary"), btn("snooze_10", "Adiar 10 min"), btn("complete", "Parar por hoje")]
+      : [btn("complete", "Concluir", "primary"), btn("snooze_10", "Adiar 10 min"), btn("snooze_60", "Adiar 1 h")],
   });
   return blocks;
 }
 
-export function sendReminder(env, it, today) {
+export function sendReminder(env, it, slot, today) {
   return slackApi(env, "chat.postMessage", {
     channel: env.SLACK_USER_ID,
-    text: `⏰ ${it.time} · ${it.title}`,
-    blocks: reminderBlocks(it, today, env),
+    text: `⏰ ${slot} · ${it.title}`,
+    blocks: reminderBlocks(it, slot, today, env),
   });
 }
 
@@ -60,7 +60,7 @@ export function sendSummary(env, items, today) {
   const late = pending.filter(i => i.date < today);
   const todays = pending.filter(i => i.date === today)
     .sort((a, b) => (a.time || "99").localeCompare(b.time || "99") || b.prio - a.prio);
-  const line = i => `• ${i.time ? `\`${i.time}\` ` : ""}${mrkdwn(i.title)}${i.prio === 2 ? " ‼️" : ""}`;
+  const line = i => `• ${i.time ? `\`${i.time}${isIntraday(i) ? `–${i.until}` : ""}\` ` : ""}${mrkdwn(i.title)}${isIntraday(i) ? ` _(${everyLabel(i)})_` : ""}${i.prio === 2 ? " ‼️" : ""}`;
   const [y, m, d] = today.split("-").map(Number);
   const title = fmtDay.format(new Date(Date.UTC(y, m - 1, d)));
   const parts = [`*Bom dia! ${title.charAt(0).toUpperCase() + title.slice(1)}*`];

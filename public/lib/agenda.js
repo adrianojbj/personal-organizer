@@ -70,6 +70,46 @@ export function recurLabel(r) {
   }
 }
 
+/* ---------- Repetição dentro do dia ---------- */
+
+const toMin = hm => { const [h, m] = hm.split(":").map(Number); return h * 60 + m; };
+const toHM = t => `${pad(Math.floor(t / 60))}:${pad(t % 60)}`;
+export const MAX_SLOTS = 96;
+
+/** Item com hora inicial, intervalo (min) e hora final: avisa várias vezes no dia. */
+export const isIntraday = it => !!(it.time && it.every > 0 && it.until);
+
+/** Horários do dia em que o item avisa, em ordem. */
+export function slotsOf(it) {
+  if (!it.time) return [];
+  if (!isIntraday(it)) return [it.time];
+  const out = [];
+  for (let t = toMin(it.time); t <= toMin(it.until) && out.length < MAX_SLOTS; t += it.every) out.push(toHM(t));
+  return out;
+}
+
+/** Chave (data+hora) do último aviso que já passou em `date` às `hm`, ou null. */
+export function lastSlotKey(it, date, hm) {
+  if (!it.time || it.date > date) return null;
+  const slots = slotsOf(it);
+  const s = it.date < date ? slots[slots.length - 1] : [...slots].reverse().find(x => x <= hm);
+  return s ? `${it.date}T${s}` : null;
+}
+
+/** Próximo horário de aviso depois de `hm` no dia do item, ou null. */
+export function nextSlot(it, date, hm) {
+  if (!it.time || it.date < date) return null;
+  if (it.date > date) return slotsOf(it)[0];
+  return slotsOf(it).find(x => x > hm) || null;
+}
+
+export function everyLabel(it) {
+  if (!isIntraday(it)) return "";
+  const e = it.every;
+  const t = e % 60 === 0 ? `${e / 60} h` : e > 60 ? `${Math.floor(e / 60)} h ${e % 60} min` : `${e} min`;
+  return `a cada ${t} até ${it.until}`;
+}
+
 /** Estado do item depois de concluído. Recorrentes avançam para a próxima data. */
 export function completedState(it, today, nowIso) {
   if (isRecurring(it)) {

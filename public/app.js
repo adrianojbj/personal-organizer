@@ -1,6 +1,6 @@
 import {
   pad, ymd, parseYmd, addDays, WD_SHORT, normRecur, alignDate, isRecurring, occursOn,
-  recurLabel, completedState,
+  recurLabel, completedState, isIntraday, slotsOf, lastSlotKey, nextSlot, everyLabel,
 } from "./lib/agenda.js";
 
 const $ = s => document.querySelector(s);
@@ -122,7 +122,8 @@ async function init() {
 /* ---------- Ações ---------- */
 function addItem(p) {
   return mutate(null, () => api("/api/items", { method: "POST", body: {
-    title: p.title, date: p.date, time: p.time || "", prio: p.prio || 0, notes: p.notes || "", recur: normRecur(p.recur, p.date),
+    title: p.title, date: p.date, time: p.time || "", every: p.every || 0, until: p.until || "",
+    prio: p.prio || 0, notes: p.notes || "", recur: normRecur(p.recur, p.date),
   } }));
 }
 function restore(id, before) {
@@ -132,13 +133,20 @@ function complete(it) {
   const before = strip(it);
   const next = completedState(it, today(), new Date().toISOString());
   mutate(next, () => api(`/api/items/${it.id}/complete`, { method: "POST" })).then(() => {
-    if (isRecurring(it)) toast("Feito. Próxima: " + relDay(next.date) + (next.time ? " às " + next.time : ""), () => restore(it.id, before));
+    if (isRecurring(it)) toast((isIntraday(it) ? "Parado por hoje. Volta " : "Feito. Próxima: ") + relDay(next.date) + (next.time ? " às " + next.time : ""), () => restore(it.id, before));
+    else if (isIntraday(it)) toast("Parado. Sem mais avisos deste item.", () => restore(it.id, before));
     else toast("Concluída", () => restore(it.id, before));
   }).catch(() => load());
 }
 const action = (it, name, optimistic, body) =>
   mutate(optimistic, () => api(`/api/items/${it.id}/${name}`, { method: "POST", body })).catch(() => load());
-const dueKey = it => it.date + "T" + it.time;
+/** Aviso atual: o último horário do dia que já passou (ou o primeiro, se nenhum passou). */
+const dueKey = it => lastSlotKey(it, today(), nowHM()) || it.date + "T" + it.time;
+/** Hora que representa o item na lista de hoje: o próximo aviso, ou o último se todos passaram. */
+function effTime(it) {
+  if (!isIntraday(it) || it.date !== today()) return it.time;
+  return nextSlot(it, today(), nowHM()) || it.until;
+}
 const reopen = it => action(it, "reopen", { ...it, done: false, doneAt: null });
 const dismiss = it => action(it, "dismiss", { ...it, ack: dueKey(it), snooze: 0 });
 function snooze(it, min) {
@@ -166,7 +174,7 @@ function relDay(ds) {
 }
 const daysLate = ds => Math.round((parseYmd(today()) - parseYmd(ds)) / 864e5);
 function sortDay(a, b) {
-  if (a.time && b.time) return a.time.localeCompare(b.time) || b.prio - a.prio;
+  if (a.time && b.time) return effTime(a).localeCompare(effTime(b)) || b.prio - a.prio;
   if (a.time) return -1;
   if (b.time) return 1;
   return b.prio - a.prio || (a.created || 0) - (b.created || 0);
@@ -175,7 +183,7 @@ function itemHTML(it, opts = {}) {
   const meta = [];
   if (opts.late) { const n = daysLate(it.date); meta.push(`<span class="late">atrasada ${n === 1 ? "desde ontem" : "há " + n + " dias"}</span>`); }
   if (opts.showDate) meta.push(`<span>${esc(relDay(it.date))}</span>`);
-  if (it.time && !it.done) meta.push(`<span>${ICON.bell}lembrete</span>`);
+  if (it.time && !it.done) meta.push(`<span>${ICON.bell}${isIntraday(it) ? esc(everyLabel(it)) : "lembrete"}</span>`);
   if (isRecurring(it)) meta.push(`<span>${ICON.rep}${esc(recurLabel(it.recur))}</span>`);
   if (it.lastDone === today() && opts.ghost) meta.push(`<span>feito hoje</span>`);
   if (it.notes) meta.push(`<span>${ICON.note}nota</span>`);
@@ -185,7 +193,7 @@ function itemHTML(it, opts = {}) {
   const act = opts.ghost ? "" : (it.done ? "reopen" : "complete");
   return `<li class="${cls.join(" ")}">
     <button class="check" type="button" data-act="${act}" data-id="${esc(it.id)}" aria-label="${it.done ? "Reabrir" : "Concluir"}: ${esc(it.title)}" ${opts.ghost ? "disabled" : ""}>${ICON.check}</button>
-    <div class="when ${it.time ? "timed" : ""}">${it.time ? esc(it.time) : "—"}</div>
+    <div class="when ${it.time ? "timed" : ""}">${it.time ? esc(opts.slotTime ? effTime(it) : it.time) : "—"}</div>
     <button class="body" type="button" data-act="edit" data-id="${esc(it.id)}">
       <span class="title">${esc(it.title)}</span>
       ${meta.length ? `<span class="meta">${meta.join("")}</span>` : ""}
@@ -215,7 +223,7 @@ function weekOccurrences() {
 }
 function renderSummary() {
   const { late, todayList, doneToday } = buckets(), hm = nowHM();
-  const left = todayList.filter(i => i.time && i.time > hm).length;
+  const left = todayList.reduce((n, i) => n + slotsOf(i).filter(x => x > hm).length, 0);
   $("#summary").innerHTML = !loaded ? "" : [
     late.length ? `<span class="stat late"><b>${late.length}</b> atrasada${late.length > 1 ? "s" : ""}</span>` : "",
     `<span class="stat"><b>${todayList.length}</b> para hoje</span>`,
@@ -237,8 +245,8 @@ function renderToday() {
     const nowRow = `<li class="nowline" aria-label="Agora ${hm}"><span class="nl-dot"></span><span class="nl-t">${hm}</span><span class="nl-bar"></span></li>`;
     let rows = "", placed = false;
     for (const i of timed) {
-      if (!placed && i.time > hm) { rows += nowRow; placed = true; }
-      rows += itemHTML(i, { notes: true });
+      if (!placed && effTime(i) > hm) { rows += nowRow; placed = true; }
+      rows += itemHTML(i, { notes: true, slotTime: true });
     }
     if (timed.length && !placed) rows += nowRow;
     rows += untimed.map(i => itemHTML(i, { notes: true })).join("");
@@ -341,7 +349,9 @@ function dueAlerts() {
     const at = parseYmd(it.date);
     const [h, m] = it.time.split(":").map(Number);
     at.setHours(h, m, 0, 0);
-    if (at > now || it.ack === dueKey(it)) return false;
+    if (at > now) return false;
+    const key = lastSlotKey(it, ts, nowHM());
+    if (!key || key <= (it.ack || "")) return false;
     return !(it.snooze && it.snooze > now.getTime());
   }).sort((a, b) => dueKey(a).localeCompare(dueKey(b)));
 }
@@ -350,19 +360,22 @@ function renderAlerts() {
   if (!loaded) { $("#alerts").innerHTML = ""; return; }
   const list = dueAlerts();
   $("#alerts").innerHTML = list.map(it => `<div class="alert" role="alert">
-      <span class="a-time">${it.date === today() ? esc(it.time) : esc(relDay(it.date)) + " " + esc(it.time)}</span>
+      <span class="a-time">${it.date === today() ? "" : esc(relDay(it.date)) + " "}${esc(dueKey(it).slice(11))}</span>
       <span class="a-title">${esc(it.title)}</span>
-      <span class="a-actions">
+      <span class="a-actions">${isIntraday(it) ? `
+        <button type="button" class="primary" data-act="dismiss" data-id="${esc(it.id)}">Feito</button>
+        <button type="button" data-act="snooze" data-id="${esc(it.id)}">Adiar 10 min</button>
+        <button type="button" data-act="complete" data-id="${esc(it.id)}">Parar por hoje</button>` : `
         <button type="button" class="primary" data-act="complete" data-id="${esc(it.id)}">Concluir</button>
         <button type="button" data-act="snooze" data-id="${esc(it.id)}">Adiar 10 min</button>
-        <button type="button" data-act="dismiss" data-id="${esc(it.id)}">Dispensar</button>
+        <button type="button" data-act="dismiss" data-id="${esc(it.id)}">Dispensar</button>`}
       </span></div>`).join("");
   let fresh = false;
   for (const it of list) {
     const k = it.id + "|" + dueKey(it) + "|" + (it.snooze || 0);
     if (announced.has(k)) continue;
     announced.add(k); fresh = true;
-    if (canNotify()) { try { new Notification("Lembrete · " + it.time, { body: it.title, tag: it.id }); } catch {} }
+    if (canNotify()) { try { new Notification("Lembrete · " + dueKey(it).slice(11), { body: it.title, tag: it.id }); } catch {} }
   }
   if (fresh) beep();
   document.title = list.length ? `(${list.length}) ${baseTitle}` : baseTitle;
@@ -381,6 +394,7 @@ document.addEventListener("visibilitychange", () => { if (document.visibilitySta
 /* ---------- Campos do formulário (usados no "Adicionar" e no editor) ---------- */
 const RECUR_OPTS = [["none", "Não repete"], ["daily", "Todo dia"], ["weekdays", "Dias úteis (seg–sex)"], ["weekly", "Toda semana"], ["monthly", "Todo mês"]];
 const PRIOS = [[0, "Normal"], [1, "Média"], [2, "Alta"]];
+const EVERY_OPTS = [[0, "Só uma vez"], [15, "A cada 15 min"], [30, "A cada 30 min"], [60, "A cada 1 h"], [90, "A cada 1 h 30"], [120, "A cada 2 h"], [180, "A cada 3 h"], [240, "A cada 4 h"]];
 
 function fieldsHTML(p, { notesCollapsed }) {
   const notes = `<textarea id="${p}-notes" maxlength="4000" aria-label="Notas"></textarea>`;
@@ -399,9 +413,13 @@ function fieldsHTML(p, { notesCollapsed }) {
       <div class="field"><span class="lbl">Prioridade</span>
         <div class="seg">${PRIOS.map(([v, l]) => `<label><input type="radio" name="${p}-prio" id="${p}-p${v}" value="${v}"><span>${l}</span></label>`).join("")}</div>
       </div>
-      <div class="field f-recur"><label for="${p}-recur">Repetir</label>
+      <div class="field f-recur"><label for="${p}-recur">Repetir em dias</label>
         <select id="${p}-recur">${RECUR_OPTS.map(([v, l]) => `<option value="${v}">${l}</option>`).join("")}</select>
       </div>
+      <div class="field"><label for="${p}-every">Avisos no dia</label>
+        <select id="${p}-every">${EVERY_OPTS.map(([v, l]) => `<option value="${v}">${l}</option>`).join("")}</select>
+      </div>
+      <div class="field"><label for="${p}-until">Até</label><input id="${p}-until" type="time"></div>
     </div>
     <div class="form-extra">
       <div class="field" id="${p}-daysField" hidden><span class="lbl">Dias da semana</span>
@@ -421,9 +439,13 @@ function readFields(p) {
   const date = fld(p, "date").value || today();
   const t = fld(p, "recur").value;
   const recur = normRecur({ t, days: t === "weekly" ? checkedDays(p) : undefined }, date);
+  const time = fld(p, "time").value || "";
+  const every = time ? +fld(p, "every").value : 0;
   return {
     date: alignDate(recur, date),
-    time: fld(p, "time").value || "",
+    time,
+    every,
+    until: every ? fld(p, "until").value || "" : "",
     prio: +(document.querySelector(`input[name="${p}-prio"]:checked`)?.value || 0),
     notes: fld(p, "notes").value.trim(),
     recur,
@@ -433,6 +455,8 @@ function readFields(p) {
 function writeFields(p, src) {
   fld(p, "date").value = src.date || today();
   fld(p, "time").value = src.time || "";
+  fld(p, "every").value = String(src.every || 0);
+  fld(p, "until").value = src.until || "";
   fld(p, "p" + (src.prio || 0)).checked = true;
   fld(p, "recur").value = (src.recur && src.recur.t) || "none";
   const days = (src.recur && src.recur.days) || [];
@@ -451,9 +475,20 @@ function syncFields(p) {
   document.querySelectorAll(`[data-form="${p}"][data-setday]`).forEach(b => {
     b.setAttribute("aria-pressed", String(date === ymd(addDays(new Date(), +b.dataset.setday))));
   });
+  const hasTime = !!fld(p, "time").value, every = +fld(p, "every").value;
+  fld(p, "every").disabled = !hasTime;
+  fld(p, "until").disabled = !hasTime || !every;
   if (!date) { fld(p, "summary").textContent = "Escolha um dia."; return; }
   const v = readFields(p);
-  const when = v.time ? ` às <b>${esc(v.time)}</b>, com lembrete` : ", sem lembrete";
+  let when = v.time ? ` às <b>${esc(v.time)}</b>, com lembrete` : ", sem lembrete";
+  if (v.every) {
+    if (!v.until || v.until <= v.time) {
+      fld(p, "summary").textContent = "Escolha em \"Até\" um horário depois do início.";
+      return;
+    }
+    const n = slotsOf(v).length, slots = slotsOf(v);
+    when = `, <b>${esc(everyLabel(v).replace(/ até .*/, ""))}</b> das ${esc(v.time)} às ${esc(slots[slots.length - 1])} (<b>${n}</b> aviso${n === 1 ? "" : "s"} por dia)`;
+  }
   fld(p, "summary").innerHTML = v.recur.t === "none"
     ? `Para <b>${esc(relDay(v.date))}</b>${when}.`
     : `Repete <b>${esc(recurLabel(v.recur))}</b>${when}. Próxima: <b>${esc(relDay(v.date))}</b>.`;
@@ -463,6 +498,10 @@ function mountFields(p, container, opts) {
   container.innerHTML = fieldsHTML(p, opts);
   container.addEventListener("input", () => syncFields(p));
   container.addEventListener("change", e => {
+    if (e.target === fld(p, "every") && +fld(p, "every").value && !fld(p, "until").value) {
+      const t = fld(p, "time").value;
+      fld(p, "until").value = t && t < "20:00" ? "20:00" : "23:00";
+    }
     if (e.target === fld(p, "recur") && fld(p, "recur").value === "weekly" && !checkedDays(p).length) {
       fld(p, "d" + parseYmd(fld(p, "date").value || today()).getDay()).checked = true;
     }
@@ -488,6 +527,7 @@ $("#composer").addEventListener("submit", e => {
   const title = quick.value.trim();
   if (!title) { quick.focus(); return; }
   const data = { title, ...readFields("q") };
+  if (data.every && (!data.until || data.until <= data.time)) { toast("Em \"Até\", escolha um horário depois do início."); fld("q", "until").focus(); return; }
   quick.value = ""; $("#addBtn").disabled = true;
   writeFields("q", { ...BLANK, date: today() });
   quick.focus();
@@ -525,7 +565,8 @@ $("#editor").addEventListener("submit", e => {
   const title = $("#f-title").value.trim();
   if (!title || !editing) return;
   const prev = editing, data = { title, ...readFields("f") };
-  const changedWhen = prev.date !== data.date || prev.time !== data.time;
+  if (data.every && (!data.until || data.until <= data.time)) { toast("Em \"Até\", escolha um horário depois do início."); fld("f", "until").focus(); return; }
+  const changedWhen = prev.date !== data.date || prev.time !== data.time || (prev.every || 0) !== data.every || (prev.until || "") !== data.until;
   const body = { ...strip(prev), ...data, ...(changedWhen ? { ack: "", snooze: 0 } : {}) };
   mutate({ ...prev, ...body }, () => api("/api/items/" + prev.id, { method: "PUT", body })).then(() => toast("Salvo")).catch(() => load());
   closeEditor();

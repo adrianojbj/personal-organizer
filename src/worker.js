@@ -1,9 +1,9 @@
-import { completedState } from "../public/lib/agenda.js";
+import { completedState, lastSlotKey, nextSlot, isIntraday, isRecurring, firstOnOrAfter } from "../public/lib/agenda.js";
 import { isAuthorized, sameOrigin, login, logoutCookie } from "./auth.js";
 import { localNow } from "./time.js";
 import {
   ValidationError, cleanInput, notifiedKeyFor, listItems, getItem, saveItem, deleteItem,
-  purgeDone, dueReminders, markNotified, getMeta, setMeta,
+  purgeDone, timedPending, pendingSlotKey, markNotified, getMeta, setMeta,
 } from "./items.js";
 import { slackEnabled, sendReminder, sendSummary, verifySlack, replaceMessage } from "./slack.js";
 
@@ -15,6 +15,9 @@ const newId = () => Date.now().toString(36) + crypto.randomUUID().replace(/-/g, 
 async function readJson(request) {
   try { return await request.json(); } catch { throw new ValidationError("Corpo da requisição não é JSON válido."); }
 }
+
+/** Aviso atual do item: o último horário que passou (ou o primeiro, se nenhum passou). */
+const currentKey = (it, local) => (it.time ? lastSlotKey(it, local.date, local.hm) || `${it.date}T${it.time}` : "");
 
 /* ---------- API da página ---------- */
 
@@ -28,7 +31,7 @@ async function api(request, env, path) {
   if (path === "/api/items" && method === "GET") return json({ items: await listItems(db) });
   if (path === "/api/items" && method === "POST") {
     const it = cleanInput(await readJson(request));
-    return json({ item: await saveItem(db, newId(), it, notifiedKeyFor(it, null, local.key), Date.now()) }, 201);
+    return json({ item: await saveItem(db, newId(), it, notifiedKeyFor(it, null, local), Date.now()) }, 201);
   }
   if (path === "/api/items/purge-done" && method === "POST") {
     return json({ removed: await purgeDone(db, local.date) });
@@ -42,7 +45,7 @@ async function api(request, env, path) {
 
   if (!action && method === "PUT") {
     const it = cleanInput(await readJson(request));
-    return json({ item: await saveItem(db, id, it, notifiedKeyFor(it, prev, local.key), prev.created) });
+    return json({ item: await saveItem(db, id, it, notifiedKeyFor(it, prev, local), prev.created) });
   }
   if (!action && method === "DELETE") { await deleteItem(db, id); return json({ ok: true }); }
   if (method !== "POST") return fail(405, "Método não permitido.");
@@ -50,14 +53,14 @@ async function api(request, env, path) {
   let next;
   if (action === "complete") next = completedState(prev, local.date, new Date().toISOString());
   else if (action === "reopen") next = { ...prev, done: false, doneAt: null };
-  else if (action === "dismiss") next = { ...prev, ack: prev.time ? `${prev.date}T${prev.time}` : "", snooze: 0 };
+  else if (action === "dismiss") next = { ...prev, ack: currentKey(prev, local), snooze: 0 };
   else if (action === "snooze") {
     const { minutes = 10 } = await readJson(request).catch(() => ({}));
     const mins = Math.min(Math.max(Number(minutes) || 10, 1), 24 * 60);
     next = { ...prev, snooze: Date.now() + mins * 60000 };
   }
   const it = cleanInput(next);
-  return json({ item: await saveItem(db, id, it, notifiedKeyFor(it, prev, local.key), prev.created) });
+  return json({ item: await saveItem(db, id, it, notifiedKeyFor(it, prev, local), prev.created) });
 }
 
 /* ---------- Botões do Slack ---------- */
@@ -76,8 +79,14 @@ async function slackInteraction(request, env, ctx) {
   if (!prev) text = "Esse item não existe mais.";
   else if (action.action_id === "complete") {
     const it = cleanInput(completedState(prev, local.date, new Date().toISOString()));
-    await saveItem(db, prev.id, it, notifiedKeyFor(it, prev, local.key), prev.created);
-    text = it.done ? `✅ Concluído · ~${prev.title}~` : `✅ Feito hoje · ${prev.title}\nPróxima: ${it.date}${it.time ? " às " + it.time : ""}`;
+    await saveItem(db, prev.id, it, notifiedKeyFor(it, prev, local), prev.created);
+    const label = isIntraday(prev) ? "⏹ Parado por hoje" : "✅ Feito hoje";
+    text = it.done ? `✅ Concluído · ~${prev.title}~` : `${label} · ${prev.title}\nPróxima: ${it.date}${it.time ? " às " + it.time : ""}`;
+  } else if (action.action_id === "slot_done") {
+    const it = cleanInput({ ...prev, ack: currentKey(prev, local), snooze: 0 });
+    await saveItem(db, prev.id, it, notifiedKeyFor(it, prev, local), prev.created);
+    const nxt = nextSlot(prev, local.date, local.hm);
+    text = `👍 Feito · ${prev.title}${nxt ? `\nPróximo aviso às ${nxt}` : "\nSem mais avisos hoje"}`;
   } else if (action.action_id.startsWith("snooze_")) {
     const mins = Number(action.action_id.split("_")[1]) || 10;
     const it = cleanInput({ ...prev, snooze: Date.now() + mins * 60000 });
@@ -91,20 +100,29 @@ async function slackInteraction(request, env, ctx) {
 /* ---------- Cron: a cada minuto ---------- */
 
 async function tick(env) {
-  if (!slackEnabled(env)) return;
-  const db = env.DB, local = localNow(env.TZ);
+  const db = env.DB, local = localNow(env.TZ), slack = slackEnabled(env);
 
-  for (const it of await dueReminders(db, local.key, Date.now())) {
+  let sent = 0;
+  for (const it of await timedPending(db, local.date)) {
+    // Lembrete que repete no dia e entre dias passa sozinho para o próximo dia, sem virar "atrasado".
+    if (isIntraday(it) && isRecurring(it) && it.date < local.date) {
+      const next = cleanInput({ ...it, date: firstOnOrAfter(it.recur, local.date), ack: "", snooze: 0 });
+      await saveItem(db, it.id, next, notifiedKeyFor(next, null, local), it.created);
+      continue;
+    }
+    const key = pendingSlotKey(it, local, Date.now());
+    if (!slack || !key || sent >= 25) continue;
     try {
-      await sendReminder(env, it, local.date);
-      await markNotified(db, it);
+      await sendReminder(env, it, key.slice(11), local.date);
+      await markNotified(db, it.id, key);
+      sent++;
     } catch (e) {
       console.error("lembrete não enviado", it.id, e.message);
     }
   }
 
   const st = env.DAILY_SUMMARY_TIME;
-  if (st && local.hm >= st && local.hm < addHour(st) && (await getMeta(db, "summary_date")) !== local.date) {
+  if (slack && st && local.hm >= st && local.hm < addHour(st) && (await getMeta(db, "summary_date")) !== local.date) {
     await setMeta(db, "summary_date", local.date);
     try { await sendSummary(env, await listItems(db), local.date); }
     catch (e) { console.error("resumo não enviado", e.message); }

@@ -91,6 +91,7 @@ h1 .mark{background:linear-gradient(transparent 52%,var(--hi) 52%,var(--hi) 92%,
 .fields{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,1fr) minmax(0,1.3fr);gap:12px 14px}
 .fields>.field{min-width:0}
 @media (max-width:600px){.fields{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.fields>.f-date,.fields>.f-recur{grid-column:1/-1}}
+.field select:disabled,.field input:disabled{opacity:.45}
 .form-extra{display:flex;flex-direction:column;gap:12px;margin-top:12px}
 .date-row{display:flex;gap:6px}
 .date-row input{flex:1 1 150px;min-width:0}

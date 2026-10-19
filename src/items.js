@@ -1,4 +1,4 @@
-import { normRecur, alignDate } from "../public/lib/agenda.js";
+import { normRecur, alignDate, lastSlotKey, slotsOf, MAX_SLOTS } from "../public/lib/agenda.js";
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
@@ -11,6 +11,8 @@ export function rowToItem(r) {
     title: r.title,
     date: r.date,
     time: r.time,
+    every: r.every_min,
+    until: r.until_hm,
     prio: r.prio,
     notes: r.notes,
     recur: JSON.parse(r.recur),
@@ -32,6 +34,13 @@ export function cleanInput(body, base = {}) {
   if (!DATE_RE.test(v.date ?? "")) throw new ValidationError("Data inválida. Use AAAA-MM-DD.");
   const time = v.time ?? "";
   if (time !== "" && !TIME_RE.test(time)) throw new ValidationError("Hora inválida. Use HH:MM.");
+  let every = Number(v.every) || 0, until = String(v.until ?? "");
+  if (!time) { every = 0; until = ""; }
+  if (every) {
+    if (!Number.isInteger(every) || every < 5 || every > 720) throw new ValidationError("O intervalo deve ficar entre 5 minutos e 12 horas.");
+    if (!TIME_RE.test(until) || until <= time) throw new ValidationError("O horário final precisa ser depois do horário inicial.");
+    if (slotsOf({ time, every, until }).length >= MAX_SLOTS) throw new ValidationError(`São no máximo ${MAX_SLOTS} avisos por dia. Aumente o intervalo.`);
+  } else until = "";
   const prio = Number(v.prio ?? 0);
   if (![0, 1, 2].includes(prio)) throw new ValidationError("Prioridade deve ser 0, 1 ou 2.");
   const notes = String(v.notes ?? "");
@@ -39,7 +48,7 @@ export function cleanInput(body, base = {}) {
   const recur = normRecur(v.recur, v.date);
   const date = alignDate(recur, v.date);
   return {
-    title, date, time, prio, notes, recur,
+    title, date, time, every, until, prio, notes, recur,
     done: !!v.done,
     doneAt: v.doneAt ?? null,
     lastDone: v.lastDone ?? null,
@@ -48,18 +57,19 @@ export function cleanInput(body, base = {}) {
   };
 }
 
-const dueKey = it => (it.time ? `${it.date}T${it.time}` : "");
+const sameSchedule = (a, b) =>
+  a.date === b.date && a.time === b.time && (a.every || 0) === (b.every || 0) && (a.until || "") === (b.until || "");
 
 /**
- * Lembrete que já passou quando foi criado ou editado não deve chegar no Slack.
- * Mantém a marca se data/hora não mudaram.
+ * Último aviso considerado enviado. Avisos que já passaram quando o item foi criado
+ * ou reprogramado não vão para o Slack; adiar libera o aviso atual de novo.
  */
-export function notifiedKeyFor(next, prev, localKey) {
-  const key = dueKey(next);
-  if (!key) return "";
-  if (prev && dueKey(prev) === key && !(next.snooze && next.snooze !== prev.snooze)) return prev.notifiedKey;
-  if (next.snooze && next.snooze > Date.now()) return "";
-  return key <= localKey ? key : "";
+export function notifiedKeyFor(next, prev, local) {
+  if (!next.time) return "";
+  const newSnooze = next.snooze && next.snooze > Date.now() && (!prev || next.snooze !== prev.snooze);
+  if (newSnooze) return "";
+  if (prev && sameSchedule(prev, next) && next.snooze === prev.snooze) return prev.notifiedKey;
+  return lastSlotKey(next, local.date, local.hm) || "";
 }
 
 export async function listItems(db) {
@@ -74,16 +84,17 @@ export async function getItem(db, id) {
 
 export async function saveItem(db, id, it, notifiedKey, created) {
   await db.prepare(
-    `INSERT INTO items (id, title, date, time, prio, notes, recur, done, done_at, last_done, ack, snooze, notified_key, created)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+    `INSERT INTO items (id, title, date, time, prio, notes, recur, done, done_at, last_done, ack, snooze, notified_key, created, every_min, until_hm)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
      ON CONFLICT(id) DO UPDATE SET
        title = excluded.title, date = excluded.date, time = excluded.time, prio = excluded.prio,
+       every_min = excluded.every_min, until_hm = excluded.until_hm,
        notes = excluded.notes, recur = excluded.recur, done = excluded.done, done_at = excluded.done_at,
        last_done = excluded.last_done, ack = excluded.ack, snooze = excluded.snooze,
        notified_key = excluded.notified_key`
   ).bind(
     id, it.title, it.date, it.time, it.prio, it.notes, JSON.stringify(it.recur),
-    it.done ? 1 : 0, it.doneAt, it.lastDone, it.ack, it.snooze, notifiedKey, created
+    it.done ? 1 : 0, it.doneAt, it.lastDone, it.ack, it.snooze, notifiedKey, created, it.every, it.until
   ).run();
   return getItem(db, id);
 }
@@ -97,22 +108,23 @@ export async function purgeDone(db, beforeDate) {
   return r.meta?.changes ?? 0;
 }
 
-/** Lembretes vencidos que ainda não foram enviados ao Slack. */
-export async function dueReminders(db, localKey, nowMs) {
+/** Itens com lembrete até hoje: candidatos a aviso ou a passar para o próximo dia. */
+export async function timedPending(db, localDate) {
   const { results } = await db.prepare(
-    `SELECT * FROM items
-     WHERE done = 0 AND time <> ''
-       AND (date || 'T' || time) <= ?1
-       AND notified_key <> (date || 'T' || time)
-       AND ack <> (date || 'T' || time)
-       AND (snooze = 0 OR snooze <= ?2)
-     ORDER BY date, time LIMIT 25`
-  ).bind(localKey, nowMs).all();
+    "SELECT * FROM items WHERE done = 0 AND time <> '' AND date <= ?1 ORDER BY date, time"
+  ).bind(localDate).all();
   return results.map(rowToItem);
 }
 
-export async function markNotified(db, it) {
-  await db.prepare("UPDATE items SET notified_key = ?2, snooze = 0 WHERE id = ?1").bind(it.id, dueKey(it)).run();
+/** Aviso que deve sair agora: o último horário que passou, ainda não enviado nem dispensado. */
+export function pendingSlotKey(it, local, nowMs) {
+  if (it.snooze && it.snooze > nowMs) return null;
+  const key = lastSlotKey(it, local.date, local.hm);
+  return key && key > (it.notifiedKey || "") && key > (it.ack || "") ? key : null;
+}
+
+export async function markNotified(db, id, key) {
+  await db.prepare("UPDATE items SET notified_key = ?2, snooze = 0 WHERE id = ?1").bind(id, key).run();
 }
 
 export async function getMeta(db, key) {

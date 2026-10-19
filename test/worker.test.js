@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { cleanInput, notifiedKeyFor, ValidationError } from "../src/items.js";
+import { cleanInput, notifiedKeyFor, pendingSlotKey, ValidationError } from "../src/items.js";
 import { verifySlack } from "../src/slack.js";
 import { localNow } from "../src/time.js";
 
@@ -13,8 +13,10 @@ test("valida a entrada da API", () => {
   assert.equal(it.date, "2026-10-22"); // alinhado à primeira quinta
 });
 
+const at = key => ({ date: key.slice(0, 10), hm: key.slice(11), key });
+
 test("lembrete criado com horário já passado não vai para o Slack", () => {
-  const local = "2026-10-19T15:00";
+  const local = at("2026-10-19T15:00");
   assert.equal(notifiedKeyFor({ date: "2026-10-19", time: "09:00" }, null, local), "2026-10-19T09:00");
   assert.equal(notifiedKeyFor({ date: "2026-10-19", time: "16:00" }, null, local), "");
   assert.equal(notifiedKeyFor({ date: "2026-10-19", time: "" }, null, local), "");
@@ -23,8 +25,38 @@ test("lembrete criado com horário já passado não vai para o Slack", () => {
 test("adiar libera um novo envio", () => {
   const prev = { date: "2026-10-19", time: "09:00", snooze: 0, notifiedKey: "2026-10-19T09:00" };
   const next = { ...prev, snooze: Date.now() + 600000 };
-  assert.equal(notifiedKeyFor(next, prev, "2026-10-19T09:05"), "");
-  assert.equal(notifiedKeyFor({ ...prev }, prev, "2026-10-19T09:05"), "2026-10-19T09:00");
+  assert.equal(notifiedKeyFor(next, prev, at("2026-10-19T09:05")), "");
+  assert.equal(notifiedKeyFor({ ...prev }, prev, at("2026-10-19T09:05")), "2026-10-19T09:00");
+});
+
+test("avisos no dia: valida intervalo e horário final", () => {
+  const base = { title: "água", date: "2026-10-19", time: "09:00" };
+  assert.throws(() => cleanInput({ ...base, every: 120, until: "08:00" }), ValidationError);
+  assert.throws(() => cleanInput({ ...base, every: 2, until: "20:00" }), ValidationError);
+  assert.throws(() => cleanInput({ ...base, every: 5, until: "23:59" }), ValidationError); // mais de 96 avisos
+  const it = cleanInput({ ...base, every: 120, until: "20:00" });
+  assert.equal(it.every, 120);
+  assert.equal(it.until, "20:00");
+  const noTime = cleanInput({ ...base, time: "", every: 120, until: "20:00" });
+  assert.equal(noTime.every, 0);
+  assert.equal(noTime.until, "");
+});
+
+test("avisos no dia: cada horário sai uma vez, na hora certa", () => {
+  const it = { date: "2026-10-19", time: "09:00", every: 120, until: "20:00", ack: "", snooze: 0, notifiedKey: "" };
+  // criado às 10:30: o aviso das 09:00 já passou e não é enviado
+  it.notifiedKey = notifiedKeyFor(it, null, at("2026-10-19T10:30"));
+  assert.equal(it.notifiedKey, "2026-10-19T09:00");
+  assert.equal(pendingSlotKey(it, at("2026-10-19T10:59"), Date.now()), null);
+  assert.equal(pendingSlotKey(it, at("2026-10-19T11:00"), Date.now()), "2026-10-19T11:00");
+  it.notifiedKey = "2026-10-19T11:00";
+  assert.equal(pendingSlotKey(it, at("2026-10-19T11:01"), Date.now()), null);
+  // "Feito" no aviso das 13:00 antes do cron enviar
+  it.ack = "2026-10-19T13:00";
+  assert.equal(pendingSlotKey(it, at("2026-10-19T13:00"), Date.now()), null);
+  assert.equal(pendingSlotKey(it, at("2026-10-19T19:00"), Date.now()), "2026-10-19T19:00");
+  // adiado: segura o aviso até o fim do adiamento
+  assert.equal(pendingSlotKey({ ...it, snooze: Date.now() + 60000 }, at("2026-10-19T19:00"), Date.now()), null);
 });
 
 test("converte o horário para o fuso configurado", () => {

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { nextAfter, completedState, normRecur, alignDate } from "../public/lib/agenda.js";
+import { nextAfter, completedState, normRecur, alignDate, slotsOf, lastSlotKey, nextSlot, everyLabel } from "../public/lib/agenda.js";
 
 test("dias úteis pulam o fim de semana", () => {
   assert.equal(nextAfter({ recur: { t: "weekdays" } }, "2026-10-23"), "2026-10-26");
@@ -30,4 +30,16 @@ test("recorrência semanal começa no próximo dia marcado", () => {
   const recur = normRecur({ t: "weekly", days: [4] }, "2026-10-19");
   assert.equal(alignDate(recur, "2026-10-19"), "2026-10-22");
   assert.equal(alignDate({ t: "none" }, "2026-10-19"), "2026-10-19");
+});
+
+test("horários de 2 em 2 h entre 9h e 20h", () => {
+  const it = { date: "2026-10-19", time: "09:00", every: 120, until: "20:00" };
+  assert.deepEqual(slotsOf(it), ["09:00", "11:00", "13:00", "15:00", "17:00", "19:00"]);
+  assert.equal(lastSlotKey(it, "2026-10-19", "08:59"), null);
+  assert.equal(lastSlotKey(it, "2026-10-19", "12:30"), "2026-10-19T11:00");
+  assert.equal(lastSlotKey(it, "2026-10-20", "08:00"), "2026-10-19T19:00");
+  assert.equal(nextSlot(it, "2026-10-19", "12:30"), "13:00");
+  assert.equal(nextSlot(it, "2026-10-19", "19:30"), null);
+  assert.equal(everyLabel(it), "a cada 2 h até 20:00");
+  assert.deepEqual(slotsOf({ time: "08:00" }), ["08:00"]);
 });
