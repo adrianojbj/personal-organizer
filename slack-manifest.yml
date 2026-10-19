@@ -1,0 +1,23 @@
+# Cole em https://api.slack.com/apps → Create New App → From an app manifest.
+# Troque a URL pela do seu Worker.
+display_information:
+  name: Meu Dia
+  description: Lembretes da sua agenda pessoal
+  background_color: "#1b2333"
+features:
+  bot_user:
+    display_name: Meu Dia
+    always_online: true
+  app_home:
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: true
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+settings:
+  interactivity:
+    is_enabled: true
+    request_url: https://meu-dia.SEU-SUBDOMINIO.workers.dev/slack/interactions
+  org_deploy_enabled: false
+  socket_mode_enabled: false
