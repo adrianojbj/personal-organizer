@@ -1,17 +1,18 @@
 name = "meu-dia"
 main = "src/worker.js"
 compatibility_date = "2026-10-01"
+account_id = "20bd3f351bc5b5c5621206b25fbc5005"
 
 # Página estática (public/) servida pelo próprio Worker.
 [assets]
 directory = "./public"
 binding = "ASSETS"
 
-# Banco SQLite gratuito (Cloudflare D1). Troque database_id pelo valor de `npm run db:create`.
+# Banco SQLite gratuito (Cloudflare D1). Criado com `npm run db:create`.
 [[d1_databases]]
 binding = "DB"
 database_name = "meu-dia"
-database_id = "COLE-AQUI-O-ID-DO-D1"
+database_id = "5cc5c19c-c013-45ad-b175-a80dab53bb15"
 migrations_dir = "migrations"
 
 # Verifica lembretes a cada minuto.
@@ -21,10 +22,8 @@ crons = ["* * * * *"]
 [vars]
 TZ = "America/Sao_Paulo"
 DAILY_SUMMARY_TIME = "08:00"   # resumo diário no Slack; deixe "" para desligar
-APP_URL = ""                   # ex.: https://meu-dia.SEU-SUBDOMINIO.workers.dev (link nas mensagens)
-ACCESS_TEAM_DOMAIN = ""        # ex.: adriano.cloudflareaccess.com
-ACCESS_AUD = ""                # "Application Audience (AUD) Tag" do app no Cloudflare Access
-OWNER_EMAIL = ""               # opcional: só aceita este e-mail vindo do Access
+APP_URL = "https://meu-dia.adrianojbj.workers.dev"
 
 # Segredos (nunca no git), via `npx wrangler secret put NOME`:
-#   SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET, SLACK_USER_ID
+#   APP_PASSWORD, SESSION_SECRET (login)
+#   SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET, SLACK_USER_ID (lembretes no Slack)

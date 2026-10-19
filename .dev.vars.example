@@ -1,5 +1,11 @@
-# Copie para .dev.vars (ignorado pelo git) para rodar localmente com `npm run dev`.
+# Configuração local (este arquivo vira .dev.vars, que fica fora do git).
+# A API aceita qualquer requisição; o app só escuta em 127.0.0.1, então só este Mac acessa.
 ALLOW_UNAUTHENTICATED=true
-SLACK_BOT_TOKEN=xoxb-...
-SLACK_SIGNING_SECRET=...
-SLACK_USER_ID=U00000000
+APP_URL=http://localhost:8787
+
+# Slack: descomente e preencha para receber lembretes por DM.
+# SLACK_BOT_TOKEN=xoxb-...
+# SLACK_USER_ID=U00000000
+# Só com URL pública (túnel ou deploy) para os botões Concluir/Adiar:
+# SLACK_INTERACTIVE=true
+# SLACK_SIGNING_SECRET=...

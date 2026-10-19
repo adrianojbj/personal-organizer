@@ -42,3 +42,28 @@ test("confere a assinatura do Slack", async () => {
   assert.equal(await verifySlack(req(sig.slice(0, -1) + (sig.endsWith("a") ? "b" : "a")), body, secret), false);
   assert.equal(await verifySlack(req(sig), body + "x", secret), false);
 });
+
+test("login por senha: sessão válida, senha errada e bloqueio", async () => {
+  const { login, isAuthorized } = await import("../src/auth.js");
+  const meta = new Map();
+  const db = { prepare: sql => ({ bind: (...a) => ({
+    first: async () => (meta.has(a[0]) ? { value: meta.get(a[0]) } : null),
+    run: async () => { meta.set(a[0], a[1]); },
+  }) }) };
+  const env = { APP_PASSWORD: "correta", SESSION_SECRET: "x".repeat(32) };
+  const req = (password, cookie) => new Request("https://meu-dia.test/api/login", {
+    method: "POST", body: JSON.stringify({ password }),
+    headers: { "content-type": "application/json", "cf-connecting-ip": "1.2.3.4", ...(cookie ? { cookie } : {}) },
+  });
+
+  const ok = await login(req("correta"), env, db);
+  assert.equal(ok.status, 200);
+  const cookie = ok.cookie.split(";")[0];
+  assert.equal(await isAuthorized(req("", cookie), env), true);
+  assert.equal(await isAuthorized(req("", cookie.replace(/.$/, c => (c === "a" ? "b" : "a"))), env), false);
+  assert.equal(await isAuthorized(req("", cookie), { ...env, APP_PASSWORD: "nova" }), false); // trocar a senha derruba a sessão
+  assert.equal(await isAuthorized(req(""), env), false);
+
+  for (let i = 0; i < 5; i++) assert.equal((await login(req("errada"), env, db)).status, 401);
+  assert.equal((await login(req("correta"), env, db)).status, 429);
+});

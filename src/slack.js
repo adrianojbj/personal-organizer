@@ -34,6 +34,8 @@ export function reminderBlocks(it, today, env) {
     { type: "section", text: { type: "mrkdwn", text: `*${mrkdwn(it.title)}*\n${meta.join(" · ")}${appLink(env)}` } },
   ];
   if (it.notes) blocks.push({ type: "context", elements: [{ type: "mrkdwn", text: mrkdwn(it.notes.slice(0, 500)) }] });
+  // Botões exigem que o Slack alcance /slack/interactions (URL pública).
+  if (env.SLACK_INTERACTIVE !== "true") return blocks;
   blocks.push({
     type: "actions",
     elements: [

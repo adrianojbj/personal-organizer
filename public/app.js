@@ -1,6 +1,6 @@
 import {
-  pad, ymd, parseYmd, addDays, WD_SHORT, normRecur, isRecurring, matchesRule, occursOn,
-  firstOnOrAfter, recurLabel, completedState, parseQuick,
+  pad, ymd, parseYmd, addDays, WD_SHORT, normRecur, alignDate, isRecurring, occursOn,
+  recurLabel, completedState,
 } from "./lib/agenda.js";
 
 const $ = s => document.querySelector(s);
@@ -29,13 +29,47 @@ async function api(path, { method = "GET", body } = {}) {
       body: body ? JSON.stringify(body) : undefined,
     });
   } catch {
-    throw new Error("Sem conexão, ou sua sessão do Cloudflare Access expirou. Recarregue a página.");
+    throw new Error("Sem conexão. Confira a internet e tente de novo.");
   }
   const data = await res.json().catch(() => ({}));
-  if (res.status === 401) throw new Error("Sessão expirada. Recarregue a página para entrar de novo.");
-  if (!res.ok) throw new Error(data.error || "Não consegui salvar. Tente de novo.");
+  if (!res.ok) {
+    const e = new Error(data.error || "Não consegui salvar. Tente de novo.");
+    e.status = res.status;
+    if (res.status === 401 && path !== "/api/login") showLogin();
+    throw e;
+  }
   return data;
 }
+
+/* ---------- Login ---------- */
+function showLogin() {
+  if (!$("#loginScrim").hidden) return;
+  $("#loginScrim").hidden = false;
+  $("#storageNote").textContent = "Entre com sua senha para ver a agenda.";
+  setTimeout(() => $("#f-pass").focus(), 0);
+}
+$("#loginForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  $("#loginBtn").disabled = true;
+  try {
+    await api("/api/login", { method: "POST", body: { password: $("#f-pass").value } });
+    $("#f-pass").value = "";
+    $("#loginMsg").textContent = "Digite a senha que você definiu para a sua agenda.";
+    $("#loginScrim").hidden = true;
+    refreshMe();
+    await load();
+  } catch (err) {
+    $("#loginMsg").textContent = err.message;
+    $("#f-pass").select();
+  } finally {
+    $("#loginBtn").disabled = false;
+  }
+});
+$("#logoutBtn").addEventListener("click", async () => {
+  try { await api("/api/logout", { method: "POST" }); } catch {}
+  items = []; loaded = false; renderAll();
+  showLogin();
+});
 
 const strip = it => { const { id, created, notifiedKey, ...rest } = it; return JSON.parse(JSON.stringify(rest)); };
 const upsertLocal = it => { const i = items.findIndex(x => x.id === it.id); if (i >= 0) items[i] = it; else items.push(it); };
@@ -47,6 +81,7 @@ async function load() {
     if (pending) return;
     items = data.items; loaded = true; renderAll();
   } catch (e) {
+    if (e.status === 401) return;
     if (!loaded) { loaded = true; renderAll(); }
     $("#storageNote").textContent = e.message;
   }
@@ -69,13 +104,18 @@ async function mutate(optimistic, call) {
   }
 }
 
-async function init() {
-  renderAll();
+function refreshMe() {
   api("/api/me").then(me => {
+    $("#logoutBtn").hidden = !me.login;
     $("#storageNote").textContent = me.slack
       ? `Lembretes também chegam no Slack${me.summaryTime ? ` · resumo diário às ${me.summaryTime}` : ""}.`
       : "Slack desligado: configure os segredos do bot para receber lembretes lá.";
-  }).catch(e => { $("#storageNote").textContent = e.message; });
+  }).catch(e => { if (e.status !== 401) $("#storageNote").textContent = e.message; });
+}
+
+async function init() {
+  renderAll();
+  refreshMe();
   await load();
 }
 
@@ -153,10 +193,9 @@ function itemHTML(it, opts = {}) {
     </button>
   </li>`;
 }
-function emptyHTML(title, text, examples) {
-  return `<div class="empty"><h3>${esc(title)}</h3><p>${esc(text)}</p>${examples ? `<div class="ex">${examples.map(e => `<button type="button" data-example="${esc(e)}">${esc(e)}</button>`).join("")}</div>` : ""}</div>`;
+function emptyHTML(title, text) {
+  return `<div class="empty"><h3>${esc(title)}</h3><p>${esc(text)}</p></div>`;
 }
-const EXAMPLES = ["revisar PRs todo dia útil 9h30", "pagar boleto do condomínio dia 10/11 !!", "1:1 com o time toda quinta 15h", "beber água às 16h", "academia toda segunda e quarta 7h"];
 
 function buckets() {
   const t = today(), open = items.filter(i => !i.done);
@@ -208,7 +247,7 @@ function renderToday() {
   if (!late.length && !todayList.length) {
     html += items.length
       ? emptyHTML("Dia livre", doneToday.length ? "Tudo de hoje está feito. Adicione algo acima ou veja os próximos dias." : "Nada marcado para hoje. Adicione uma tarefa acima ou veja os próximos dias.")
-      : emptyHTML("Comece pelo que precisa lembrar hoje", "Digite em português comum: o app entende dia, hora, prioridade e repetição. Toque num exemplo para preencher a caixa acima.", EXAMPLES);
+      : emptyHTML("Comece pelo que precisa lembrar hoje", "Escreva a tarefa acima e escolha o dia. Com hora, ela vira lembrete. Também dá para definir prioridade e repetição.");
   }
   if (doneToday.length) html += `<details class="donebox"><summary>Feitas hoje · ${doneToday.length}</summary><ul class="list">${doneToday.map(i => itemHTML(i, { ghost: !i.done })).join("")}</ul></details>`;
   return html;
@@ -339,61 +378,131 @@ setInterval(() => {
 setInterval(() => { if (document.visibilityState === "visible" && $("#scrim").hidden) load(); }, 30000);
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") load(); });
 
-/* ---------- Entrada rápida ---------- */
-const quick = $("#quick");
-const HINT = `<span class="hint">Escreva data, hora, prioridade (<span class="mono">!</span> média, <span class="mono">!!</span> alta) e repetição direto no texto.</span>`;
-function renderPreview() {
-  const v = quick.value.trim();
-  $("#addBtn").disabled = !v;
-  if (!v) { $("#preview").innerHTML = HINT; return; }
-  const p = parseQuick(v), chips = [`<span class="chip">${esc(relDay(p.date))}</span>`];
-  if (p.time) chips.push(`<span class="chip">⏰ ${esc(p.time)}</span>`);
-  if (p.recur.t !== "none") chips.push(`<span class="chip">↻ ${esc(recurLabel(p.recur))}</span>`);
-  if (p.prio) chips.push(`<span class="chip p${p.prio}">${p.prio === 2 ? "alta" : "média"}</span>`);
-  if (!p.title) chips.push(`<span class="hint">Falta dizer o quê.</span>`);
-  $("#preview").innerHTML = chips.join("");
+/* ---------- Campos do formulário (usados no "Adicionar" e no editor) ---------- */
+const RECUR_OPTS = [["none", "Não repete"], ["daily", "Todo dia"], ["weekdays", "Dias úteis (seg–sex)"], ["weekly", "Toda semana"], ["monthly", "Todo mês"]];
+const PRIOS = [[0, "Normal"], [1, "Média"], [2, "Alta"]];
+
+function fieldsHTML(p, { notesCollapsed }) {
+  const notes = `<textarea id="${p}-notes" maxlength="4000" aria-label="Notas"></textarea>`;
+  return `
+    <div class="fields">
+      <div class="field f-date"><label for="${p}-date">Dia</label>
+        <div class="date-row">
+          <input id="${p}-date" type="date" required>
+          <div class="quick-days">
+            <button type="button" data-setday="0" data-form="${p}" aria-pressed="false">Hoje</button>
+            <button type="button" data-setday="1" data-form="${p}" aria-pressed="false">Amanhã</button>
+          </div>
+        </div>
+      </div>
+      <div class="field"><label for="${p}-time">Hora do lembrete</label><input id="${p}-time" type="time"></div>
+      <div class="field"><span class="lbl">Prioridade</span>
+        <div class="seg">${PRIOS.map(([v, l]) => `<label><input type="radio" name="${p}-prio" id="${p}-p${v}" value="${v}"><span>${l}</span></label>`).join("")}</div>
+      </div>
+      <div class="field f-recur"><label for="${p}-recur">Repetir</label>
+        <select id="${p}-recur">${RECUR_OPTS.map(([v, l]) => `<option value="${v}">${l}</option>`).join("")}</select>
+      </div>
+    </div>
+    <div class="form-extra">
+      <div class="field" id="${p}-daysField" hidden><span class="lbl">Dias da semana</span>
+        <div class="days">${[1, 2, 3, 4, 5, 6, 0].map(w => `<label><input type="checkbox" id="${p}-d${w}" value="${w}">${WD_SHORT[w]}</label>`).join("")}</div>
+      </div>
+      <p class="form-summary" id="${p}-summary" aria-live="polite"></p>
+      ${notesCollapsed
+        ? `<details class="notes-toggle" id="${p}-notesBox"><summary>+ Adicionar nota</summary>${notes}</details>`
+        : `<div class="field"><label for="${p}-notes">Notas</label>${notes}</div>`}
+    </div>`;
 }
-quick.addEventListener("input", renderPreview);
+
+const fld = (p, name) => $(`#${p}-${name}`);
+const checkedDays = p => [1, 2, 3, 4, 5, 6, 0].filter(w => fld(p, "d" + w).checked);
+
+function readFields(p) {
+  const date = fld(p, "date").value || today();
+  const t = fld(p, "recur").value;
+  const recur = normRecur({ t, days: t === "weekly" ? checkedDays(p) : undefined }, date);
+  return {
+    date: alignDate(recur, date),
+    time: fld(p, "time").value || "",
+    prio: +(document.querySelector(`input[name="${p}-prio"]:checked`)?.value || 0),
+    notes: fld(p, "notes").value.trim(),
+    recur,
+  };
+}
+
+function writeFields(p, src) {
+  fld(p, "date").value = src.date || today();
+  fld(p, "time").value = src.time || "";
+  fld(p, "p" + (src.prio || 0)).checked = true;
+  fld(p, "recur").value = (src.recur && src.recur.t) || "none";
+  const days = (src.recur && src.recur.days) || [];
+  [0, 1, 2, 3, 4, 5, 6].forEach(w => { fld(p, "d" + w).checked = days.includes(w); });
+  fld(p, "notes").value = src.notes || "";
+  const box = $(`#${p}-notesBox`);
+  if (box) box.open = !!src.notes;
+  syncFields(p);
+}
+
+/** Mostra os dias da semana quando precisa e resume em uma frase o que vai ser salvo. */
+function syncFields(p) {
+  const t = fld(p, "recur").value;
+  fld(p, "daysField").hidden = t !== "weekly";
+  const date = fld(p, "date").value;
+  document.querySelectorAll(`[data-form="${p}"][data-setday]`).forEach(b => {
+    b.setAttribute("aria-pressed", String(date === ymd(addDays(new Date(), +b.dataset.setday))));
+  });
+  if (!date) { fld(p, "summary").textContent = "Escolha um dia."; return; }
+  const v = readFields(p);
+  const when = v.time ? ` às <b>${esc(v.time)}</b>, com lembrete` : ", sem lembrete";
+  fld(p, "summary").innerHTML = v.recur.t === "none"
+    ? `Para <b>${esc(relDay(v.date))}</b>${when}.`
+    : `Repete <b>${esc(recurLabel(v.recur))}</b>${when}. Próxima: <b>${esc(relDay(v.date))}</b>.`;
+}
+
+function mountFields(p, container, opts) {
+  container.innerHTML = fieldsHTML(p, opts);
+  container.addEventListener("input", () => syncFields(p));
+  container.addEventListener("change", e => {
+    if (e.target === fld(p, "recur") && fld(p, "recur").value === "weekly" && !checkedDays(p).length) {
+      fld(p, "d" + parseYmd(fld(p, "date").value || today()).getDay()).checked = true;
+    }
+    syncFields(p);
+  });
+  container.addEventListener("click", e => {
+    const b = e.target.closest("[data-setday]");
+    if (!b) return;
+    fld(p, "date").value = ymd(addDays(new Date(), +b.dataset.setday));
+    syncFields(p);
+  });
+}
+
+const BLANK = { date: "", time: "", prio: 0, notes: "", recur: { t: "none" } };
+
+/* ---------- Adicionar ---------- */
+const quick = $("#quick");
+mountFields("q", $("#qFields"), { notesCollapsed: true });
+writeFields("q", { ...BLANK, date: today() });
+quick.addEventListener("input", () => { $("#addBtn").disabled = !quick.value.trim(); });
 $("#composer").addEventListener("submit", e => {
   e.preventDefault();
-  const v = quick.value.trim();
-  if (!v) return;
-  const p = parseQuick(v);
-  if (!p.title) { toast("Escreva o que precisa fazer, além da data ou hora."); return; }
-  quick.value = ""; renderPreview(); quick.focus();
-  addItem(p).then(() => toast(`Adicionado para ${relDay(p.date)}${p.time ? " às " + p.time : ""}`))
-    .catch(() => { quick.value = v; renderPreview(); });
-});
-$("#moreBtn").addEventListener("click", () => {
-  const v = quick.value.trim();
-  openEditor(null, v ? parseQuick(v) : null);
+  const title = quick.value.trim();
+  if (!title) { quick.focus(); return; }
+  const data = { title, ...readFields("q") };
+  quick.value = ""; $("#addBtn").disabled = true;
+  writeFields("q", { ...BLANK, date: today() });
+  quick.focus();
+  addItem(data).then(() => toast(`Adicionado para ${relDay(data.date)}${data.time ? " às " + data.time : ""}`))
+    .catch(() => { quick.value = title; $("#addBtn").disabled = false; writeFields("q", data); });
 });
 
 /* ---------- Editor ---------- */
 let editing = null, delArmed = false;
-const daysBox = $("#days");
-daysBox.innerHTML = [1, 2, 3, 4, 5, 6, 0].map(w => `<label><input type="checkbox" id="f-d${w}" value="${w}">${WD_SHORT[w]}</label>`).join("");
-const syncDays = () => { $("#daysField").hidden = $("#f-recur").value !== "weekly"; };
-$("#f-recur").addEventListener("change", () => {
-  if ($("#f-recur").value === "weekly" && !daysBox.querySelector("input:checked")) {
-    $("#f-d" + parseYmd($("#f-date").value || today()).getDay()).checked = true;
-  }
-  syncDays();
-});
-function openEditor(it, draft) {
+mountFields("f", $("#fFields"), { notesCollapsed: false });
+function openEditor(it) {
   editing = it; delArmed = false;
-  const src = it || draft || { title: "", date: today(), time: "", prio: 0, notes: "", recur: { t: "none" } };
-  $("#edTitle").textContent = it ? "Editar" : "Novo item";
-  $("#f-title").value = src.title || "";
-  $("#f-date").value = src.date || today();
-  $("#f-time").value = src.time || "";
-  $("#f-p" + (src.prio || 0)).checked = true;
-  $("#f-recur").value = (src.recur && src.recur.t) || "none";
-  daysBox.querySelectorAll("input").forEach(c => { c.checked = ((src.recur && src.recur.days) || []).includes(+c.value); });
-  $("#f-notes").value = src.notes || "";
-  $("#delBtn").hidden = !it;
+  $("#f-title").value = it.title || "";
+  writeFields("f", it);
   $("#delBtn").textContent = "Excluir";
-  syncDays();
   $("#scrim").hidden = false;
   setTimeout(() => $("#f-title").focus(), 0);
 }
@@ -414,29 +523,16 @@ $("#delBtn").addEventListener("click", () => {
 $("#editor").addEventListener("submit", e => {
   e.preventDefault();
   const title = $("#f-title").value.trim();
-  if (!title) return;
-  const date = $("#f-date").value || today();
-  const t = $("#f-recur").value;
-  let recur = { t };
-  if (t === "weekly") recur.days = [...daysBox.querySelectorAll("input:checked")].map(c => +c.value);
-  if (t === "monthly") recur.dom = parseYmd(date).getDate();
-  recur = normRecur(recur, date);
-  const d = t !== "none" && !matchesRule({ recur, date }, parseYmd(date)) ? firstOnOrAfter(recur, date) : date;
-  const data = { title, date: d, time: $("#f-time").value || "", prio: +(document.querySelector('input[name="prio"]:checked')?.value || 0), notes: $("#f-notes").value.trim(), recur };
-  if (editing) {
-    const prev = editing, changedWhen = prev.date !== data.date || prev.time !== data.time;
-    const body = { ...strip(prev), ...data, ...(changedWhen ? { ack: "", snooze: 0 } : {}) };
-    mutate({ ...prev, ...body }, () => api("/api/items/" + prev.id, { method: "PUT", body })).then(() => toast("Salvo")).catch(() => load());
-  } else {
-    addItem(data).then(() => toast(`Adicionado para ${relDay(data.date)}`)).catch(() => {});
-  }
+  if (!title || !editing) return;
+  const prev = editing, data = { title, ...readFields("f") };
+  const changedWhen = prev.date !== data.date || prev.time !== data.time;
+  const body = { ...strip(prev), ...data, ...(changedWhen ? { ack: "", snooze: 0 } : {}) };
+  mutate({ ...prev, ...body }, () => api("/api/items/" + prev.id, { method: "PUT", body })).then(() => toast("Salvo")).catch(() => load());
   closeEditor();
 });
 
 /* ---------- Cliques ---------- */
 document.addEventListener("click", e => {
-  const ex = e.target.closest("[data-example]");
-  if (ex) { quick.value = ex.dataset.example; renderPreview(); quick.focus(); return; }
   if (e.target.closest("#purgeBtn")) {
     mutate(null, () => api("/api/items/purge-done", { method: "POST" }))
       .then(r => { toast(`${r.removed} concluída${r.removed === 1 ? "" : "s"} removida${r.removed === 1 ? "" : "s"}`); return load(); })

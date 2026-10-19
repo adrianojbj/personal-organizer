@@ -1,40 +1,72 @@
-// Valida o JWT do Cloudflare Access (header Cf-Access-Jwt-Assertion).
-// Sem Access configurado, a API recusa tudo, exceto com ALLOW_UNAUTHENTICATED=true (só para dev local).
+// Login por senha. APP_PASSWORD e SESSION_SECRET são segredos do Worker (wrangler secret put).
+// A sessão é um cookie assinado com HMAC; trocar a senha ou o SESSION_SECRET derruba todas as sessões.
+import { getMeta, setMeta } from "./items.js";
 
-const b64urlToBytes = s => {
-  const b = atob(s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4));
-  return Uint8Array.from(b, c => c.charCodeAt(0));
-};
-const decodeJson = s => JSON.parse(new TextDecoder().decode(b64urlToBytes(s)));
+const COOKIE = "md_session";
+const MAX_AGE = 30 * 24 * 3600;
+const LIMIT = 5, WINDOW = 15 * 60 * 1000;
 
-let certsCache = { at: 0, keys: [] };
+const enc = s => new TextEncoder().encode(s);
+const hex = buf => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+const sha = async s => hex(await crypto.subtle.digest("SHA-256", enc(s)));
 
-async function accessKeys(team) {
-  if (Date.now() - certsCache.at < 10 * 60 * 1000 && certsCache.keys.length) return certsCache.keys;
-  const res = await fetch(`https://${team}/cdn-cgi/access/certs`);
-  if (!res.ok) throw new Error("Não consegui buscar as chaves do Cloudflare Access.");
-  const { keys } = await res.json();
-  certsCache = { at: Date.now(), keys };
-  return keys;
+export function safeEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let d = 0;
+  for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return d === 0;
 }
+
+async function sign(env, msg) {
+  const key = await crypto.subtle.importKey("raw", enc(`${env.SESSION_SECRET}:${env.APP_PASSWORD}`), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return hex(await crypto.subtle.sign("HMAC", key, enc(msg)));
+}
+
+function readCookie(request, name) {
+  for (const part of (request.headers.get("cookie") || "").split(/;\s*/)) {
+    const i = part.indexOf("=");
+    if (i > 0 && part.slice(0, i) === name) return part.slice(i + 1);
+  }
+  return null;
+}
+
+export const authConfigured = env => !!(env.APP_PASSWORD && env.SESSION_SECRET);
 
 export async function isAuthorized(request, env) {
   if (env.ALLOW_UNAUTHENTICATED === "true") return true;
-  const team = env.ACCESS_TEAM_DOMAIN, aud = env.ACCESS_AUD;
-  const token = request.headers.get("cf-access-jwt-assertion");
-  if (!team || !aud || !token) return false;
-  try {
-    const [h, p, s] = token.split(".");
-    const header = decodeJson(h), payload = decodeJson(p);
-    const now = Math.floor(Date.now() / 1000);
-    const audOk = Array.isArray(payload.aud) ? payload.aud.includes(aud) : payload.aud === aud;
-    if (!audOk || payload.iss !== `https://${team}` || !(payload.exp > now)) return false;
-    if (env.OWNER_EMAIL && payload.email?.toLowerCase() !== env.OWNER_EMAIL.toLowerCase()) return false;
-    const jwk = (await accessKeys(team)).find(k => k.kid === header.kid);
-    if (!jwk) return false;
-    const key = await crypto.subtle.importKey("jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
-    return await crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, b64urlToBytes(s), new TextEncoder().encode(`${h}.${p}`));
-  } catch {
-    return false;
-  }
+  if (!authConfigured(env)) return false;
+  const [exp, sig] = (readCookie(request, COOKIE) || "").split(".");
+  if (!exp || !sig || !(Number(exp) > Date.now() / 1000)) return false;
+  return safeEqual(sig, await sign(env, exp));
 }
+
+/** Bloqueia requisições de outros sites (além do SameSite=Strict do cookie). */
+export function sameOrigin(request) {
+  const origin = request.headers.get("origin");
+  return !origin || origin === new URL(request.url).origin;
+}
+
+export async function login(request, env, db) {
+  if (!authConfigured(env)) {
+    return { status: 503, error: "A senha ainda não foi configurada. Rode: npx wrangler secret put APP_PASSWORD" };
+  }
+  const key = "login:" + (request.headers.get("cf-connecting-ip") || "local");
+  const st = JSON.parse((await getMeta(db, key)) || '{"n":0,"at":0}');
+  const inWindow = Date.now() - st.at < WINDOW;
+  if (st.n >= LIMIT && inWindow) {
+    const min = Math.ceil((WINDOW - (Date.now() - st.at)) / 60000);
+    return { status: 429, error: `Muitas tentativas erradas. Tente de novo em ${min} min.` };
+  }
+  let password = "";
+  try { ({ password = "" } = await request.json()); } catch {}
+  if (!safeEqual(await sha(String(password)), await sha(env.APP_PASSWORD))) {
+    const n = inWindow ? st.n + 1 : 1;
+    await setMeta(db, key, JSON.stringify({ n, at: n === 1 ? Date.now() : st.at }));
+    return { status: 401, error: n >= LIMIT ? "Senha incorreta. Login bloqueado por 15 min." : "Senha incorreta." };
+  }
+  await setMeta(db, key, '{"n":0,"at":0}');
+  const exp = String(Math.floor(Date.now() / 1000) + MAX_AGE);
+  return { status: 200, cookie: `${COOKIE}=${exp}.${await sign(env, exp)}; Path=/; Max-Age=${MAX_AGE}; HttpOnly; Secure; SameSite=Strict` };
+}
+
+export const logoutCookie = `${COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict`;

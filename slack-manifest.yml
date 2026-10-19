@@ -1,5 +1,6 @@
 # Cole em https://api.slack.com/apps → Create New App → From an app manifest.
-# Troque a URL pela do seu Worker.
+# Rodando só local, deixe interactivity desligado (is_enabled: false).
+# Com URL pública (deploy ou túnel), ligue, troque a URL e use SLACK_INTERACTIVE=true.
 display_information:
   name: Meu Dia
   description: Lembretes da sua agenda pessoal
@@ -17,7 +18,7 @@ oauth_config:
       - chat:write
 settings:
   interactivity:
-    is_enabled: true
-    request_url: https://meu-dia.SEU-SUBDOMINIO.workers.dev/slack/interactions
+    is_enabled: false
+    request_url: https://meu-dia.adrianojbj.workers.dev/slack/interactions
   org_deploy_enabled: false
   socket_mode_enabled: false

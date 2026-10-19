@@ -1,5 +1,5 @@
 import { completedState } from "../public/lib/agenda.js";
-import { isAuthorized } from "./auth.js";
+import { isAuthorized, sameOrigin, login, logoutCookie } from "./auth.js";
 import { localNow } from "./time.js";
 import {
   ValidationError, cleanInput, notifiedKeyFor, listItems, getItem, saveItem, deleteItem,
@@ -23,7 +23,7 @@ async function api(request, env, path) {
   const local = localNow(env.TZ);
 
   if (path === "/api/me" && method === "GET") {
-    return json({ tz: env.TZ || "America/Sao_Paulo", slack: slackEnabled(env), summaryTime: env.DAILY_SUMMARY_TIME || null });
+    return json({ tz: env.TZ || "America/Sao_Paulo", slack: slackEnabled(env), summaryTime: env.DAILY_SUMMARY_TIME || null, login: env.ALLOW_UNAUTHENTICATED !== "true" });
   }
   if (path === "/api/items" && method === "GET") return json({ items: await listItems(db) });
   if (path === "/api/items" && method === "POST") {
@@ -117,7 +117,19 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === "/slack/interactions" && request.method === "POST") return slackInteraction(request, env, ctx);
     if (url.pathname.startsWith("/api/")) {
-      if (!(await isAuthorized(request, env))) return fail(401, "Acesso não autorizado. Entre pelo Cloudflare Access.");
+      if (request.method !== "GET" && !sameOrigin(request)) return fail(403, "Origem não permitida.");
+      if (url.pathname === "/api/login" && request.method === "POST") {
+        const r = await login(request, env, env.DB);
+        const res = r.cookie ? json({ ok: true }) : fail(r.status, r.error);
+        if (r.cookie) res.headers.set("set-cookie", r.cookie);
+        return res;
+      }
+      if (url.pathname === "/api/logout" && request.method === "POST") {
+        const res = json({ ok: true });
+        res.headers.set("set-cookie", logoutCookie);
+        return res;
+      }
+      if (!(await isAuthorized(request, env))) return fail(401, "Entre com sua senha para continuar.");
       try {
         return await api(request, env, url.pathname);
       } catch (e) {

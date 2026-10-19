@@ -1,10 +1,11 @@
 {
   "name": "meu-dia",
   "version": "2.0.0",
-  "description": "Agenda pessoal com tarefas, lembretes e recorrência, com avisos no Slack. Cloudflare Workers + D1.",
+  "description": "Agenda pessoal com tarefas, lembretes e recorrência, com avisos no Slack. Roda local (D1/SQLite) ou na Cloudflare.",
   "private": true,
   "type": "module",
   "scripts": {
+    "start": "node scripts/local.mjs",
     "dev": "wrangler dev --test-scheduled",
     "deploy": "wrangler deploy",
     "test": "node --test test/*.test.js",
